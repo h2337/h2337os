@@ -9,6 +9,7 @@
 #include "pic.h"
 #include "pit.h"
 #include "pmm.h"
+#include "process.h"
 #include "shell.h"
 #include "vmm.h"
 #include <limine.h>
@@ -51,6 +52,10 @@ void kmain(void) {
 
   kprint("\n=== Initializing Keyboard ===\n");
   keyboard_init();
+
+  kprint("\n=== Initializing Process Management ===\n");
+  process_init();
+  scheduler_init();
 
   asm volatile("sti");
   kprint("Interrupts enabled\n");

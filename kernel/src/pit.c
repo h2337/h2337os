@@ -2,6 +2,7 @@
 #include "console.h"
 #include "idt.h"
 #include "pic.h"
+#include "process.h"
 #include <stdint.h>
 
 static volatile uint64_t timer_ticks = 0;
@@ -19,6 +20,7 @@ static inline uint8_t inb(uint16_t port) {
 
 void pit_handler(void) {
   timer_ticks++;
+  scheduler_tick();
   pic_send_eoi(0);
 }
 

@@ -5,6 +5,7 @@
 #include "libc.h"
 #include "pit.h"
 #include "pmm.h"
+#include "process.h"
 #include "vmm.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -27,6 +28,9 @@ static int cmd_uptime(int argc, char **argv);
 static int cmd_hex(int argc, char **argv);
 static int cmd_sleep(int argc, char **argv);
 static int cmd_timer(int argc, char **argv);
+static int cmd_ps(int argc, char **argv);
+static int cmd_spawn(int argc, char **argv);
+static int cmd_kill(int argc, char **argv);
 
 static shell_command_t shell_commands[] = {
     {"help", "Display available commands", cmd_help},
@@ -41,6 +45,9 @@ static shell_command_t shell_commands[] = {
     {"hex", "Display hexadecimal value", cmd_hex},
     {"sleep", "Sleep for specified milliseconds", cmd_sleep},
     {"timer", "Display timer information", cmd_timer},
+    {"ps", "List running processes", cmd_ps},
+    {"spawn", "Spawn a test process", cmd_spawn},
+    {"kill", "Kill a process by PID", cmd_kill},
     {NULL, NULL, NULL}};
 
 static int cmd_help(int argc, char **argv) {
@@ -317,6 +324,128 @@ static int cmd_timer(int argc, char **argv) {
   kprint_hex(pit_get_seconds());
   kprint("\n");
 
+  return 0;
+}
+
+static void test_process_1(void) {
+  int counter = 0;
+  while (1) {
+    kprint("[P1:");
+    kprint_hex(counter++);
+    kprint("] ");
+    process_sleep(1000);
+    if (counter >= 10) {
+      kprint("[P1 exiting]\n");
+      process_exit(0);
+    }
+  }
+}
+
+static void test_process_2(void) {
+  int counter = 0;
+  while (1) {
+    kprint("[P2:");
+    kprint_hex(counter++);
+    kprint("] ");
+    process_sleep(1500);
+    if (counter >= 7) {
+      kprint("[P2 exiting]\n");
+      process_exit(0);
+    }
+  }
+}
+
+static void cpu_intensive_process(void) {
+  uint64_t counter = 0;
+  while (1) {
+    counter++;
+    if ((counter & 0xFFFFF) == 0) {
+      kprint("[CPU:");
+      kprint_hex(counter >> 20);
+      kprint("] ");
+    }
+    if (counter >= 0x5000000) {
+      kprint("[CPU process done]\n");
+      process_exit(0);
+    }
+  }
+}
+
+static int cmd_ps(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+
+  process_list();
+  return 0;
+}
+
+static int cmd_spawn(int argc, char **argv) {
+  if (argc < 2) {
+    kprint("Usage: spawn <test1|test2|cpu>\n");
+    kprint("  test1 - Spawn test process 1 (prints every 1s)\n");
+    kprint("  test2 - Spawn test process 2 (prints every 1.5s)\n");
+    kprint("  cpu   - Spawn CPU-intensive process\n");
+    return 1;
+  }
+
+  if (strcmp(argv[1], "test1") == 0) {
+    process_create("test1", test_process_1);
+    kprint("Spawned test process 1\n");
+  } else if (strcmp(argv[1], "test2") == 0) {
+    process_create("test2", test_process_2);
+    kprint("Spawned test process 2\n");
+  } else if (strcmp(argv[1], "cpu") == 0) {
+    process_create("cpu_test", cpu_intensive_process);
+    kprint("Spawned CPU-intensive process\n");
+  } else {
+    kprint("Unknown process type: ");
+    kprint(argv[1]);
+    kprint("\n");
+    return 1;
+  }
+
+  return 0;
+}
+
+static int cmd_kill(int argc, char **argv) {
+  if (argc < 2) {
+    kprint("Usage: kill <pid>\n");
+    return 1;
+  }
+
+  uint32_t pid = 0;
+  char *str = argv[1];
+
+  while (*str) {
+    if (*str >= '0' && *str <= '9') {
+      pid = pid * 10 + (*str - '0');
+    } else {
+      kprint("Invalid PID\n");
+      return 1;
+    }
+    str++;
+  }
+
+  process_t *proc = process_get_by_pid(pid);
+  if (!proc) {
+    kprint("Process with PID ");
+    kprint_hex(pid);
+    kprint(" not found\n");
+    return 1;
+  }
+
+  if (pid == 0) {
+    kprint("Cannot kill idle process\n");
+    return 1;
+  }
+
+  kprint("Killing process '");
+  kprint(proc->name);
+  kprint("' (PID ");
+  kprint_hex(pid);
+  kprint(")\n");
+
+  process_destroy(proc);
   return 0;
 }
 
