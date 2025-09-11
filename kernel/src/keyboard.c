@@ -128,14 +128,6 @@ void keyboard_handler(void) {
           }
 
           keyboard_add_to_buffer(c);
-
-          if (c == '\n') {
-            kprint("\n");
-          } else if (c == '\b') {
-            kprint("\b \b");
-          } else if (c >= 32 && c <= 126) {
-            kputchar(c);
-          }
         }
       }
       break;

@@ -382,15 +382,21 @@ void shell_run(void) {
             buffer_pos = strlen(shell_buffer);
             kprint(shell_buffer);
 
-          } else if (arrow == 'B' && history_pos < history_count - 1) {
+          } else if (arrow == 'B') {
             for (size_t i = 0; i < buffer_pos; i++) {
               kprint("\b \b");
             }
 
-            history_pos++;
-            strcpy(shell_buffer, shell_history[history_pos]);
-            buffer_pos = strlen(shell_buffer);
-            kprint(shell_buffer);
+            if (history_pos < history_count - 1) {
+              history_pos++;
+              strcpy(shell_buffer, shell_history[history_pos]);
+              buffer_pos = strlen(shell_buffer);
+              kprint(shell_buffer);
+            } else if (history_pos < history_count) {
+              history_pos = history_count;
+              shell_buffer[0] = '\0';
+              buffer_pos = 0;
+            }
           }
         }
       }
