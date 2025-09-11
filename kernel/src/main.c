@@ -11,6 +11,7 @@
 #include "pit.h"
 #include "pmm.h"
 #include "process.h"
+#include "ramdisk.h"
 #include "shell.h"
 #include "syscall.h"
 #include "usermode.h"
@@ -64,7 +65,7 @@ void kmain(void) {
   kprint("\n=== Initializing Filesystem ===\n");
   vfs_init();
   fat32_init();
-  vfs_mount(NULL, "/", "fat32");
+  ramdisk_init();
 
   asm volatile("sti");
   kprint("Interrupts enabled\n");

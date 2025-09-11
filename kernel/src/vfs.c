@@ -403,3 +403,5 @@ int vfs_seek_fd(int fd, int32_t offset, int whence) {
 }
 
 vfs_node_t *vfs_get_root(void) { return vfs_root; }
+
+void vfs_set_root(vfs_node_t *root) { vfs_root = root; }

@@ -17,6 +17,10 @@ __attribute__((used,
                section(".limine_requests"))) volatile struct limine_hhdm_request
     hhdm_request = {.id = LIMINE_HHDM_REQUEST, .revision = 0};
 
+__attribute__((
+    used, section(".limine_requests"))) volatile struct limine_module_request
+    module_request = {.id = LIMINE_MODULE_REQUEST, .revision = 0};
+
 __attribute__((used, section(".limine_requests_"
                              "start"))) volatile LIMINE_REQUESTS_START_MARKER;
 

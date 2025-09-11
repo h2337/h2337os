@@ -698,4 +698,95 @@ void fat32_unmount(vfs_node_t *node) {
 
 void fat32_init(void) { vfs_register_filesystem(&fat32_filesystem); }
 
+vfs_node_t *fat32_mount_ramdisk(uint8_t *data, uint64_t size) {
+  if (!data || size < sizeof(fat32_bpb_t)) {
+    kprint("Invalid ramdisk data\n");
+    return NULL;
+  }
+
+  fat32_bpb_t *bpb = (fat32_bpb_t *)data;
+
+  // Verify FAT32 signature
+  if (bpb->boot_signature != 0x29) {
+    kprint("Invalid FAT32 boot signature\n");
+    return NULL;
+  }
+
+  fat32_fs_t *fs = kmalloc(sizeof(fat32_fs_t));
+  if (!fs) {
+    return NULL;
+  }
+
+  memset(fs, 0, sizeof(fat32_fs_t));
+
+  // Parse BPB
+  fs->sectors_per_cluster = bpb->sectors_per_cluster;
+  fs->bytes_per_cluster = fs->sectors_per_cluster * bpb->bytes_per_sector;
+
+  uint32_t total_sectors =
+      bpb->total_sectors_32 ? bpb->total_sectors_32 : bpb->total_sectors_16;
+  uint32_t fat_sectors = bpb->fat_size_32 * bpb->number_of_fats;
+  uint32_t data_sectors = total_sectors - (bpb->reserved_sectors + fat_sectors);
+  fs->total_clusters = data_sectors / fs->sectors_per_cluster;
+
+  // Calculate offsets
+  uint32_t fat_offset = bpb->reserved_sectors * bpb->bytes_per_sector;
+  uint32_t data_offset = fat_offset + (fat_sectors * bpb->bytes_per_sector);
+
+  // Set up FAT buffer
+  fs->fat_buffer = kmalloc(fs->total_clusters * sizeof(uint32_t));
+  if (!fs->fat_buffer) {
+    kfree(fs);
+    return NULL;
+  }
+
+  // Copy FAT from ramdisk
+  memcpy(fs->fat_buffer, data + fat_offset,
+         bpb->fat_size_32 * bpb->bytes_per_sector);
+
+  fs->cluster_buffer = kmalloc(fs->bytes_per_cluster);
+  if (!fs->cluster_buffer) {
+    kfree(fs->fat_buffer);
+    kfree(fs);
+    return NULL;
+  }
+
+  // Set up data region - copy from ramdisk instead of just pointing
+  uint32_t data_size = (fs->total_clusters - 2) * fs->bytes_per_cluster;
+  fs->data_region = kmalloc(data_size);
+  if (!fs->data_region) {
+    kfree(fs->cluster_buffer);
+    kfree(fs->fat_buffer);
+    kfree(fs);
+    return NULL;
+  }
+
+  // Copy data region from ramdisk
+  memcpy(fs->data_region, data + data_offset, data_size);
+
+  // Create root node
+  fat32_dir_entry_t root_entry;
+  memset(&root_entry, 0, sizeof(fat32_dir_entry_t));
+  memset(root_entry.name, ' ', 11);
+  root_entry.name[0] = '/';
+  root_entry.attr = FAT32_ATTR_DIRECTORY;
+  root_entry.first_cluster_hi = (bpb->root_cluster >> 16) & 0xFFFF;
+  root_entry.first_cluster_lo = bpb->root_cluster & 0xFFFF;
+
+  fat32_node_t *root = fat32_create_node(fs, &root_entry, "/");
+  if (!root) {
+    kfree(fs->cluster_buffer);
+    kfree(fs->fat_buffer);
+    kfree(fs);
+    return NULL;
+  }
+
+  root->base.fs = &fat32_filesystem;
+  strcpy(root->base.name, "/");
+
+  kprint("FAT32 filesystem mounted from ramdisk\n");
+
+  return (vfs_node_t *)root;
+}
+
 vfs_filesystem_t *fat32_get_filesystem(void) { return &fat32_filesystem; }

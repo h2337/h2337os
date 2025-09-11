@@ -102,6 +102,7 @@ typedef struct fat32_node {
 void fat32_init(void);
 vfs_filesystem_t *fat32_get_filesystem(void);
 vfs_node_t *fat32_mount(const char *device, const char *mountpoint);
+vfs_node_t *fat32_mount_ramdisk(uint8_t *data, uint64_t size);
 void fat32_unmount(vfs_node_t *node);
 
 uint32_t fat32_read(vfs_node_t *node, uint32_t offset, uint32_t size,

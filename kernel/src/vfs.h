@@ -118,6 +118,7 @@ uint32_t vfs_write_fd(int fd, uint8_t *buffer, uint32_t size);
 int vfs_seek_fd(int fd, int32_t offset, int whence);
 
 vfs_node_t *vfs_get_root(void);
+void vfs_set_root(vfs_node_t *root);
 vfs_node_t *vfs_resolve_path(const char *path);
 
 #endif
