@@ -94,7 +94,9 @@ typedef struct fat32_node {
   uint32_t first_cluster;
   uint32_t current_cluster;
   uint32_t parent_cluster;
+  uint32_t dir_entry_index;
   fat32_dir_entry_t dir_entry;
+  uint8_t modified;
 } fat32_node_t;
 
 void fat32_init(void);

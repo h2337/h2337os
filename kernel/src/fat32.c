@@ -5,6 +5,13 @@
 #include "vfs.h"
 #include <stddef.h>
 
+// Forward declarations
+static fat32_node_t *fat32_create_node_with_parent(fat32_fs_t *fs,
+                                                   fat32_dir_entry_t *entry,
+                                                   const char *name,
+                                                   uint32_t parent_cluster,
+                                                   uint32_t dir_entry_index);
+
 static vfs_filesystem_t fat32_filesystem = {.name = "fat32",
                                             .mount = fat32_mount,
                                             .unmount = fat32_unmount,
@@ -128,6 +135,14 @@ static void fat32_create_short_name(const char *long_name, char *short_name) {
 
 static fat32_node_t *fat32_create_node(fat32_fs_t *fs, fat32_dir_entry_t *entry,
                                        const char *name) {
+  return fat32_create_node_with_parent(fs, entry, name, 0, 0);
+}
+
+static fat32_node_t *fat32_create_node_with_parent(fat32_fs_t *fs,
+                                                   fat32_dir_entry_t *entry,
+                                                   const char *name,
+                                                   uint32_t parent_cluster,
+                                                   uint32_t dir_entry_index) {
   fat32_node_t *node = kmalloc(sizeof(fat32_node_t));
   if (!node) {
     return NULL;
@@ -159,6 +174,9 @@ static fat32_node_t *fat32_create_node(fat32_fs_t *fs, fat32_dir_entry_t *entry,
   node->first_cluster =
       ((uint32_t)entry->first_cluster_hi << 16) | entry->first_cluster_lo;
   node->current_cluster = node->first_cluster;
+  node->parent_cluster = parent_cluster;
+  node->dir_entry_index = dir_entry_index;
+  node->modified = 0;
   memcpy(&node->dir_entry, entry, sizeof(fat32_dir_entry_t));
 
   return node;
@@ -284,6 +302,7 @@ uint32_t fat32_write(vfs_node_t *node, uint32_t offset, uint32_t size,
   if (offset + bytes_written > node->size) {
     node->size = offset + bytes_written;
     fat_node->dir_entry.size = node->size;
+    fat_node->modified = 1;
   }
 
   return bytes_written;
@@ -294,7 +313,37 @@ void fat32_open(vfs_node_t *node, uint32_t flags) {
   (void)flags;
 }
 
-void fat32_close(vfs_node_t *node) { (void)node; }
+void fat32_close(vfs_node_t *node) {
+  fat32_node_t *fat_node = (fat32_node_t *)node;
+
+  if (!fat_node || !fat_node->modified) {
+    return;
+  }
+
+  fat32_fs_t *fs = fat_node->fs;
+  if (!fs || fat_node->parent_cluster == 0) {
+    return;
+  }
+
+  // Read the parent directory cluster that contains this file's entry
+  if (fat32_read_cluster(fs, fat_node->parent_cluster, fs->cluster_buffer) <
+      0) {
+    return;
+  }
+
+  fat32_dir_entry_t *entries = (fat32_dir_entry_t *)fs->cluster_buffer;
+
+  // Update the directory entry with the new size and cluster info
+  entries[fat_node->dir_entry_index].size = fat_node->dir_entry.size;
+  entries[fat_node->dir_entry_index].first_cluster_hi =
+      (fat_node->first_cluster >> 16) & 0xFFFF;
+  entries[fat_node->dir_entry_index].first_cluster_lo =
+      fat_node->first_cluster & 0xFFFF;
+
+  // Write the updated directory cluster back
+  fat32_write_cluster(fs, fat_node->parent_cluster, fs->cluster_buffer);
+  fat_node->modified = 0;
+}
 
 vfs_node_t *fat32_readdir(vfs_node_t *node, uint32_t index) {
   fat32_node_t *fat_node = (fat32_node_t *)node;
@@ -398,7 +447,8 @@ vfs_node_t *fat32_finddir(vfs_node_t *node, const char *name) {
       fat32_parse_filename(entries[i].name, entry_name);
 
       if (strcmp(entry_name, name) == 0) {
-        return (vfs_node_t *)fat32_create_node(fs, &entries[i], name);
+        return (vfs_node_t *)fat32_create_node_with_parent(fs, &entries[i],
+                                                           name, cluster, i);
       }
     }
 
