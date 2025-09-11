@@ -40,3 +40,17 @@ char kgetchar(void) {
   }
   return 0;
 }
+
+void kprint_hex(uint64_t value) {
+  char hex_chars[] = "0123456789ABCDEF";
+  char buffer[17];
+  int i;
+
+  for (i = 15; i >= 0; i--) {
+    buffer[i] = hex_chars[value & 0xF];
+    value >>= 4;
+  }
+  buffer[16] = '\0';
+
+  kprint(buffer);
+}

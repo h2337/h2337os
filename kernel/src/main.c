@@ -1,6 +1,8 @@
 #include "console.h"
 #include "flanterm/flanterm.h"
 #include "flanterm/flanterm_backends/fb.h"
+#include "gdt.h"
+#include "idt.h"
 #include <limine.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -44,6 +46,13 @@ void kmain(void) {
       framebuffer_request.response->framebuffers[0];
 
   console_init(framebuffer);
+
+  kprint("h2337os kernel starting...\n");
+
+  gdt_init();
+  idt_init();
+
+  kprint("Interrupt system initialized successfully!\n");
 
   hcf();
 }
