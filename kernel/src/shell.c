@@ -6,6 +6,7 @@
 #include "pit.h"
 #include "pmm.h"
 #include "process.h"
+#include "vfs.h"
 #include "vmm.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -31,6 +32,12 @@ static int cmd_timer(int argc, char **argv);
 static int cmd_ps(int argc, char **argv);
 static int cmd_spawn(int argc, char **argv);
 static int cmd_kill(int argc, char **argv);
+static int cmd_ls(int argc, char **argv);
+static int cmd_cat(int argc, char **argv);
+static int cmd_write(int argc, char **argv);
+static int cmd_mkdir(int argc, char **argv);
+static int cmd_rm(int argc, char **argv);
+static int cmd_touch(int argc, char **argv);
 
 static shell_command_t shell_commands[] = {
     {"help", "Display available commands", cmd_help},
@@ -48,6 +55,12 @@ static shell_command_t shell_commands[] = {
     {"ps", "List running processes", cmd_ps},
     {"spawn", "Spawn a test process", cmd_spawn},
     {"kill", "Kill a process by PID", cmd_kill},
+    {"ls", "List directory contents", cmd_ls},
+    {"cat", "Display file contents", cmd_cat},
+    {"write", "Write text to file", cmd_write},
+    {"mkdir", "Create a directory", cmd_mkdir},
+    {"rm", "Remove a file", cmd_rm},
+    {"touch", "Create an empty file", cmd_touch},
     {NULL, NULL, NULL}};
 
 static int cmd_help(int argc, char **argv) {
@@ -610,4 +623,256 @@ void shell_run(void) {
     }
     asm volatile("hlt");
   }
+}
+
+static int cmd_ls(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+
+  vfs_node_t *dir = vfs_get_root();
+  if (!dir) {
+    kprint("Error: No filesystem mounted\n");
+    return 1;
+  }
+
+  if (argc > 1) {
+    dir = vfs_resolve_path(argv[1]);
+    if (!dir) {
+      kprint("Error: Directory not found: ");
+      kprint(argv[1]);
+      kprint("\n");
+      return 1;
+    }
+  }
+
+  if (!(dir->type & VFS_DIRECTORY)) {
+    kprint("Error: Not a directory\n");
+    return 1;
+  }
+
+  kprint("Directory listing:\n");
+  uint32_t index = 0;
+  vfs_node_t *child;
+
+  while ((child = vfs_readdir(dir, index++)) != NULL) {
+    if (child->type & VFS_DIRECTORY) {
+      kprint("[DIR]  ");
+    } else {
+      kprint("[FILE] ");
+    }
+    kprint(child->name);
+    if (!(child->type & VFS_DIRECTORY)) {
+      kprint(" (");
+      kprint_hex(child->size);
+      kprint(" bytes)");
+    }
+    kprint("\n");
+    kfree(child);
+  }
+
+  return 0;
+}
+
+static int cmd_cat(int argc, char **argv) {
+  if (argc < 2) {
+    kprint("Usage: cat <filename>\n");
+    return 1;
+  }
+
+  vfs_node_t *file = vfs_open(argv[1], VFS_READ);
+  if (!file) {
+    kprint("Error: File not found: ");
+    kprint(argv[1]);
+    kprint("\n");
+    return 1;
+  }
+
+  if (file->type & VFS_DIRECTORY) {
+    kprint("Error: ");
+    kprint(argv[1]);
+    kprint(" is a directory\n");
+    vfs_close(file);
+    return 1;
+  }
+
+  uint8_t *buffer = kmalloc(file->size + 1);
+  if (!buffer) {
+    kprint("Error: Out of memory\n");
+    vfs_close(file);
+    return 1;
+  }
+
+  uint32_t bytes_read = vfs_read(file, 0, file->size, buffer);
+  buffer[bytes_read] = '\0';
+
+  kprint((char *)buffer);
+  if (bytes_read > 0 && buffer[bytes_read - 1] != '\n') {
+    kprint("\n");
+  }
+
+  kfree(buffer);
+  vfs_close(file);
+  return 0;
+}
+
+static int cmd_write(int argc, char **argv) {
+  if (argc < 3) {
+    kprint("Usage: write <filename> <text>\n");
+    return 1;
+  }
+
+  vfs_node_t *file = vfs_open(argv[1], VFS_WRITE | VFS_CREATE | VFS_TRUNCATE);
+  if (!file) {
+    kprint("Error: Cannot create file: ");
+    kprint(argv[1]);
+    kprint("\n");
+    return 1;
+  }
+
+  size_t total_len = 0;
+  for (int i = 2; i < argc; i++) {
+    total_len += strlen(argv[i]);
+    if (i < argc - 1)
+      total_len++;
+  }
+
+  char *buffer = kmalloc(total_len + 1);
+  if (!buffer) {
+    kprint("Error: Out of memory\n");
+    vfs_close(file);
+    return 1;
+  }
+
+  buffer[0] = '\0';
+  for (int i = 2; i < argc; i++) {
+    strcat(buffer, argv[i]);
+    if (i < argc - 1) {
+      strcat(buffer, " ");
+    }
+  }
+
+  uint32_t bytes_written =
+      vfs_write(file, 0, strlen(buffer), (uint8_t *)buffer);
+
+  kprint("Wrote ");
+  kprint_hex(bytes_written);
+  kprint(" bytes to ");
+  kprint(argv[1]);
+  kprint("\n");
+
+  kfree(buffer);
+  vfs_close(file);
+  return 0;
+}
+
+static int cmd_mkdir(int argc, char **argv) {
+  if (argc < 2) {
+    kprint("Usage: mkdir <dirname>\n");
+    return 1;
+  }
+
+  char dirpath[VFS_MAX_PATH];
+  char dirname[VFS_MAX_NAME];
+
+  strcpy(dirpath, argv[1]);
+  char *last_slash = NULL;
+  for (char *p = dirpath; *p; p++) {
+    if (*p == '/') {
+      last_slash = p;
+    }
+  }
+
+  vfs_node_t *parent;
+  if (last_slash) {
+    strcpy(dirname, last_slash + 1);
+    *last_slash = '\0';
+    parent = vfs_resolve_path(dirpath);
+  } else {
+    strcpy(dirname, argv[1]);
+    parent = vfs_get_root();
+  }
+
+  if (!parent) {
+    kprint("Error: Parent directory not found\n");
+    return 1;
+  }
+
+  if (vfs_create(parent, dirname, VFS_DIRECTORY) < 0) {
+    kprint("Error: Cannot create directory: ");
+    kprint(argv[1]);
+    kprint("\n");
+    return 1;
+  }
+
+  kprint("Created directory: ");
+  kprint(argv[1]);
+  kprint("\n");
+  return 0;
+}
+
+static int cmd_rm(int argc, char **argv) {
+  if (argc < 2) {
+    kprint("Usage: rm <filename>\n");
+    return 1;
+  }
+
+  char filepath[VFS_MAX_PATH];
+  char filename[VFS_MAX_NAME];
+
+  strcpy(filepath, argv[1]);
+  char *last_slash = NULL;
+  for (char *p = filepath; *p; p++) {
+    if (*p == '/') {
+      last_slash = p;
+    }
+  }
+
+  vfs_node_t *parent;
+  if (last_slash) {
+    strcpy(filename, last_slash + 1);
+    *last_slash = '\0';
+    parent = vfs_resolve_path(filepath);
+  } else {
+    strcpy(filename, argv[1]);
+    parent = vfs_get_root();
+  }
+
+  if (!parent) {
+    kprint("Error: Parent directory not found\n");
+    return 1;
+  }
+
+  if (vfs_unlink(parent, filename) < 0) {
+    kprint("Error: Cannot remove: ");
+    kprint(argv[1]);
+    kprint("\n");
+    return 1;
+  }
+
+  kprint("Removed: ");
+  kprint(argv[1]);
+  kprint("\n");
+  return 0;
+}
+
+static int cmd_touch(int argc, char **argv) {
+  if (argc < 2) {
+    kprint("Usage: touch <filename>\n");
+    return 1;
+  }
+
+  vfs_node_t *file = vfs_open(argv[1], VFS_WRITE | VFS_CREATE);
+  if (!file) {
+    kprint("Error: Cannot create file: ");
+    kprint(argv[1]);
+    kprint("\n");
+    return 1;
+  }
+
+  vfs_close(file);
+
+  kprint("Created file: ");
+  kprint(argv[1]);
+  kprint("\n");
+  return 0;
 }

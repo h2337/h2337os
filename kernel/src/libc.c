@@ -134,3 +134,36 @@ char *strrchr(const char *s, int c) {
     return (char *)s;
   return (char *)last;
 }
+
+char *strtok(char *str, const char *delim) {
+  static char *last = NULL;
+
+  if (str) {
+    last = str;
+  } else if (!last) {
+    return NULL;
+  }
+
+  while (*last && strchr(delim, *last)) {
+    last++;
+  }
+
+  if (!*last) {
+    last = NULL;
+    return NULL;
+  }
+
+  char *token = last;
+
+  while (*last && !strchr(delim, *last)) {
+    last++;
+  }
+
+  if (*last) {
+    *last++ = '\0';
+  } else {
+    last = NULL;
+  }
+
+  return token;
+}

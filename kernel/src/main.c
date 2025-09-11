@@ -1,4 +1,5 @@
 #include "console.h"
+#include "fat32.h"
 #include "flanterm/flanterm.h"
 #include "flanterm/flanterm_backends/fb.h"
 #include "gdt.h"
@@ -11,6 +12,7 @@
 #include "pmm.h"
 #include "process.h"
 #include "shell.h"
+#include "vfs.h"
 #include "vmm.h"
 #include <limine.h>
 #include <stdbool.h>
@@ -55,6 +57,11 @@ void kmain(void) {
 
   kprint("\n=== Initializing Process Management ===\n");
   process_init();
+
+  kprint("\n=== Initializing Filesystem ===\n");
+  vfs_init();
+  fat32_init();
+  vfs_mount(NULL, "/", "fat32");
 
   asm volatile("sti");
   kprint("Interrupts enabled\n");
