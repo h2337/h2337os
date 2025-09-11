@@ -6,6 +6,7 @@
 #include "pit.h"
 #include "pmm.h"
 #include "process.h"
+#include "usermode.h"
 #include "vfs.h"
 #include "vmm.h"
 #include <stdbool.h>
@@ -40,6 +41,7 @@ static int cmd_rm(int argc, char **argv);
 static int cmd_touch(int argc, char **argv);
 static int cmd_pwd(int argc, char **argv);
 static int cmd_cd(int argc, char **argv);
+static int cmd_usermode(int argc, char **argv);
 
 static shell_command_t shell_commands[] = {
     {"help", "Display available commands", cmd_help},
@@ -65,6 +67,7 @@ static shell_command_t shell_commands[] = {
     {"touch", "Create an empty file", cmd_touch},
     {"pwd", "Print working directory", cmd_pwd},
     {"cd", "Change directory", cmd_cd},
+    {"usermode", "Test user mode", cmd_usermode},
     {NULL, NULL, NULL}};
 
 static int cmd_help(int argc, char **argv) {
@@ -919,5 +922,14 @@ static int cmd_cd(int argc, char **argv) {
     return 1;
   }
 
+  return 0;
+}
+
+static int cmd_usermode(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+
+  kprint("Testing user mode transition...\n");
+  usermode_test();
   return 0;
 }

@@ -12,6 +12,8 @@
 #include "pmm.h"
 #include "process.h"
 #include "shell.h"
+#include "syscall.h"
+#include "usermode.h"
 #include "vfs.h"
 #include "vmm.h"
 #include <limine.h>
@@ -46,6 +48,7 @@ void kmain(void) {
   idt_init();
   pic_init();
   pit_init();
+  syscall_init();
 
   kprint("Initializing memory management...\n");
   pmm_init();

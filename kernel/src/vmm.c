@@ -12,7 +12,7 @@ static page_table_t kernel_pagemap;
 static uint64_t hhdm_offset = 0;
 
 static uint64_t *get_next_level(uint64_t *current_level, size_t index,
-                                bool allocate) {
+                                bool allocate, uint64_t flags) {
   uint64_t entry = current_level[index];
 
   if (!(entry & VMM_PRESENT)) {
@@ -26,7 +26,12 @@ static uint64_t *get_next_level(uint64_t *current_level, size_t index,
     }
 
     entry = (uint64_t)new_page | VMM_PRESENT | VMM_WRITABLE;
+    if (flags & VMM_USER) {
+      entry |= VMM_USER;
+    }
     current_level[index] = entry;
+  } else if ((flags & VMM_USER) && !(entry & VMM_USER)) {
+    current_level[index] |= VMM_USER;
   }
 
   return (uint64_t *)((entry & 0x000FFFFFFFFFF000) + hhdm_offset);
@@ -88,15 +93,15 @@ bool vmm_map_page(page_table_t *pagemap, uint64_t virt, uint64_t phys,
   size_t pd_index = PD_GET_INDEX(virt);
   size_t pt_index = PT_GET_INDEX(virt);
 
-  uint64_t *pdp = get_next_level(pagemap->pml4, pml4_index, true);
+  uint64_t *pdp = get_next_level(pagemap->pml4, pml4_index, true, flags);
   if (pdp == NULL)
     return false;
 
-  uint64_t *pd = get_next_level(pdp, pdp_index, true);
+  uint64_t *pd = get_next_level(pdp, pdp_index, true, flags);
   if (pd == NULL)
     return false;
 
-  uint64_t *pt = get_next_level(pd, pd_index, true);
+  uint64_t *pt = get_next_level(pd, pd_index, true, flags);
   if (pt == NULL)
     return false;
 
@@ -113,15 +118,15 @@ bool vmm_unmap_page(page_table_t *pagemap, uint64_t virt) {
   size_t pd_index = PD_GET_INDEX(virt);
   size_t pt_index = PT_GET_INDEX(virt);
 
-  uint64_t *pdp = get_next_level(pagemap->pml4, pml4_index, false);
+  uint64_t *pdp = get_next_level(pagemap->pml4, pml4_index, false, 0);
   if (pdp == NULL)
     return false;
 
-  uint64_t *pd = get_next_level(pdp, pdp_index, false);
+  uint64_t *pd = get_next_level(pdp, pdp_index, false, 0);
   if (pd == NULL)
     return false;
 
-  uint64_t *pt = get_next_level(pd, pd_index, false);
+  uint64_t *pt = get_next_level(pd, pd_index, false, 0);
   if (pt == NULL)
     return false;
 
@@ -142,15 +147,15 @@ uint64_t vmm_get_phys(page_table_t *pagemap, uint64_t virt) {
   size_t pd_index = PD_GET_INDEX(virt);
   size_t pt_index = PT_GET_INDEX(virt);
 
-  uint64_t *pdp = get_next_level(pagemap->pml4, pml4_index, false);
+  uint64_t *pdp = get_next_level(pagemap->pml4, pml4_index, false, 0);
   if (pdp == NULL)
     return 0;
 
-  uint64_t *pd = get_next_level(pdp, pdp_index, false);
+  uint64_t *pd = get_next_level(pdp, pdp_index, false, 0);
   if (pd == NULL)
     return 0;
 
-  uint64_t *pt = get_next_level(pd, pd_index, false);
+  uint64_t *pt = get_next_level(pd, pd_index, false, 0);
   if (pt == NULL)
     return 0;
 
