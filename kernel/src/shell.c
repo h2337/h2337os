@@ -1,5 +1,6 @@
 #include "shell.h"
 #include "console.h"
+#include "elf.h"
 #include "heap.h"
 #include "keyboard.h"
 #include "libc.h"
@@ -42,6 +43,7 @@ static int cmd_touch(int argc, char **argv);
 static int cmd_pwd(int argc, char **argv);
 static int cmd_cd(int argc, char **argv);
 static int cmd_usermode(int argc, char **argv);
+static int cmd_exec(int argc, char **argv);
 
 static shell_command_t shell_commands[] = {
     {"help", "Display available commands", cmd_help},
@@ -68,6 +70,7 @@ static shell_command_t shell_commands[] = {
     {"pwd", "Print working directory", cmd_pwd},
     {"cd", "Change directory", cmd_cd},
     {"usermode", "Test user mode", cmd_usermode},
+    {"exec", "Execute an ELF binary", cmd_exec},
     {NULL, NULL, NULL}};
 
 static int cmd_help(int argc, char **argv) {
@@ -513,10 +516,39 @@ void shell_process_command(char *input) {
     return;
   }
 
+  // First check built-in commands
   for (int i = 0; shell_commands[i].name != NULL; i++) {
     if (strcmp(argv[0], shell_commands[i].name) == 0) {
       shell_commands[i].handler(argc, argv);
       return;
+    }
+  }
+
+  // Try to execute as a binary from /bin
+  char path[VFS_MAX_PATH];
+  strcpy(path, "/bin/");
+  strcat(path, argv[0]);
+
+  vfs_node_t *file = vfs_open(path, VFS_READ);
+  if (file) {
+    if (!(file->type & VFS_DIRECTORY)) {
+      // Check if it's an ELF binary
+      uint8_t header[4];
+      uint32_t bytes_read = vfs_read(file, 0, 4, header);
+      vfs_close(file);
+
+      if (bytes_read == 4 && *(uint32_t *)header == 0x464C457F) {
+        // It's an ELF binary, execute it
+        int result = elf_exec(path, argv, NULL);
+        if (result < 0) {
+          kprint("Failed to execute: ");
+          kprint(argv[0]);
+          kprint("\n");
+        }
+        return;
+      }
+    } else {
+      vfs_close(file);
     }
   }
 
@@ -931,5 +963,70 @@ static int cmd_usermode(int argc, char **argv) {
 
   kprint("Testing user mode transition...\n");
   usermode_test();
+  return 0;
+}
+
+static int cmd_exec(int argc, char **argv) {
+  if (argc < 2) {
+    kprint("Usage: exec <binary>\n");
+    return 1;
+  }
+
+  // Build the full path
+  char path[VFS_MAX_PATH];
+  if (argv[1][0] == '/' || strchr(argv[1], '/')) {
+    strcpy(path, argv[1]);
+  } else {
+    strcpy(path, "/bin/");
+    strcat(path, argv[1]);
+  }
+
+  // Check if file exists
+  vfs_node_t *file = vfs_open(path, VFS_READ);
+  if (!file) {
+    kprint("Error: File not found: ");
+    kprint(path);
+    kprint("\n");
+    return 1;
+  }
+
+  // Check if it's a regular file
+  if (file->type & VFS_DIRECTORY) {
+    kprint("Error: ");
+    kprint(path);
+    kprint(" is a directory\n");
+    vfs_close(file);
+    return 1;
+  }
+
+  // Read ELF header to verify
+  uint8_t header[4];
+  uint32_t bytes_read = vfs_read(file, 0, 4, header);
+  vfs_close(file);
+
+  if (bytes_read != 4 || *(uint32_t *)header != 0x464C457F) {
+    kprint("Error: ");
+    kprint(path);
+    kprint(" is not an ELF binary\n");
+    return 1;
+  }
+
+  // Create args array starting from argv[1] (the binary name)
+  char **exec_argv = &argv[1];
+
+  // Execute the ELF binary
+  int result = elf_exec(path, exec_argv, NULL);
+
+  // elf_exec returns 0 on success, negative on error
+  if (result < 0) {
+    kprint("Error: Failed to execute ");
+    kprint(path);
+    kprint(" (error code: ");
+    kprint_hex(result);
+    kprint(")\n");
+    return 1;
+  }
+
+  // Success! The program was executed
   return 0;
 }

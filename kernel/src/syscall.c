@@ -1,5 +1,6 @@
 #include "syscall.h"
 #include "console.h"
+#include "elf.h"
 #include "heap.h"
 #include "idt.h"
 #include "libc.h"
@@ -121,10 +122,7 @@ static uint64_t sys_fork(void) {
 
 static uint64_t sys_execve(const char *path, char *const argv[],
                            char *const envp[]) {
-  (void)path;
-  (void)argv;
-  (void)envp;
-  return -1;
+  return elf_exec(path, argv, envp);
 }
 
 static uint64_t sys_waitpid(int pid, int *status, int options) {
