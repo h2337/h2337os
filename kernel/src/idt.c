@@ -1,5 +1,7 @@
 #include "idt.h"
 #include "console.h"
+#include "keyboard.h"
+#include "pic.h"
 #include <stddef.h>
 
 static struct idt_entry idt[256];
@@ -37,6 +39,23 @@ extern void isr28(void);
 extern void isr29(void);
 extern void isr30(void);
 extern void isr31(void);
+
+extern void isr32(void);
+extern void isr33(void);
+extern void isr34(void);
+extern void isr35(void);
+extern void isr36(void);
+extern void isr37(void);
+extern void isr38(void);
+extern void isr39(void);
+extern void isr40(void);
+extern void isr41(void);
+extern void isr42(void);
+extern void isr43(void);
+extern void isr44(void);
+extern void isr45(void);
+extern void isr46(void);
+extern void isr47(void);
 
 static const char *exception_messages[] = {"Division By Zero",
                                            "Debug",
@@ -88,7 +107,20 @@ static void load_idt(void) {
   asm volatile("lidt %0" : : "m"(idtr));
 }
 
+void irq_handler(struct interrupt_frame *frame) {
+  if (frame->int_no == 33) {
+    keyboard_handler();
+  } else {
+    pic_send_eoi(frame->int_no - 32);
+  }
+}
+
 void exception_handler(struct interrupt_frame *frame) {
+  if (frame->int_no >= 32) {
+    irq_handler(frame);
+    return;
+  }
+
   kprint("\n=== EXCEPTION OCCURRED ===\n");
   kprint("Exception: ");
 
@@ -213,6 +245,23 @@ void idt_init(void) {
   idt_set_gate(29, (uint64_t)isr29, 0x08, 0x8E);
   idt_set_gate(30, (uint64_t)isr30, 0x08, 0x8E);
   idt_set_gate(31, (uint64_t)isr31, 0x08, 0x8E);
+
+  idt_set_gate(32, (uint64_t)isr32, 0x08, 0x8E);
+  idt_set_gate(33, (uint64_t)isr33, 0x08, 0x8E);
+  idt_set_gate(34, (uint64_t)isr34, 0x08, 0x8E);
+  idt_set_gate(35, (uint64_t)isr35, 0x08, 0x8E);
+  idt_set_gate(36, (uint64_t)isr36, 0x08, 0x8E);
+  idt_set_gate(37, (uint64_t)isr37, 0x08, 0x8E);
+  idt_set_gate(38, (uint64_t)isr38, 0x08, 0x8E);
+  idt_set_gate(39, (uint64_t)isr39, 0x08, 0x8E);
+  idt_set_gate(40, (uint64_t)isr40, 0x08, 0x8E);
+  idt_set_gate(41, (uint64_t)isr41, 0x08, 0x8E);
+  idt_set_gate(42, (uint64_t)isr42, 0x08, 0x8E);
+  idt_set_gate(43, (uint64_t)isr43, 0x08, 0x8E);
+  idt_set_gate(44, (uint64_t)isr44, 0x08, 0x8E);
+  idt_set_gate(45, (uint64_t)isr45, 0x08, 0x8E);
+  idt_set_gate(46, (uint64_t)isr46, 0x08, 0x8E);
+  idt_set_gate(47, (uint64_t)isr47, 0x08, 0x8E);
 
   load_idt();
 

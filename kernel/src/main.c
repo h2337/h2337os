@@ -4,7 +4,9 @@
 #include "gdt.h"
 #include "heap.h"
 #include "idt.h"
+#include "keyboard.h"
 #include "limine_requests.h"
+#include "pic.h"
 #include "pmm.h"
 #include "vmm.h"
 #include <limine.h>
@@ -37,6 +39,7 @@ void kmain(void) {
 
   gdt_init();
   idt_init();
+  pic_init();
 
   kprint("Initializing memory management...\n");
   pmm_init();
@@ -84,7 +87,22 @@ void kmain(void) {
   kfree(test4);
   kprint("All test allocations freed\n");
 
-  kprint("\n=== System Ready ===\n");
+  kprint("\n=== Initializing Keyboard ===\n");
+  keyboard_init();
 
-  hcf();
+  asm volatile("sti");
+  kprint("Interrupts enabled\n");
+
+  kprint("\n=== System Ready ===\n");
+  kprint("Type something to test keyboard input:\n> ");
+
+  while (1) {
+    if (keyboard_has_input()) {
+      char c = keyboard_getchar();
+      if (c == '\n') {
+        kprint("> ");
+      }
+    }
+    asm volatile("hlt");
+  }
 }
