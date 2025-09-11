@@ -333,6 +333,7 @@ static void test_process_1(void) {
     kprint("[P1:");
     kprint_hex(counter++);
     kprint("] ");
+    process_yield(); // Give other processes a chance
     process_sleep(1000);
     if (counter >= 10) {
       kprint("[P1 exiting]\n");
@@ -347,6 +348,7 @@ static void test_process_2(void) {
     kprint("[P2:");
     kprint_hex(counter++);
     kprint("] ");
+    process_yield(); // Give other processes a chance
     process_sleep(1500);
     if (counter >= 7) {
       kprint("[P2 exiting]\n");

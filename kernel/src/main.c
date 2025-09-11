@@ -55,13 +55,16 @@ void kmain(void) {
 
   kprint("\n=== Initializing Process Management ===\n");
   process_init();
-  scheduler_init();
 
   asm volatile("sti");
   kprint("Interrupts enabled\n");
 
   kprint("\n=== System Ready ===\n");
 
+  // Enable scheduler for background processes
+  scheduler_init();
+
+  // Initialize and run shell in main kernel thread
   shell_init();
   shell_run();
 }

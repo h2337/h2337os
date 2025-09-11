@@ -49,18 +49,12 @@ void process_init(void) {
 
   uint64_t *stack_top =
       (uint64_t *)((uint8_t *)idle_process->stack + KERNEL_STACK_SIZE);
-  stack_top--;
-  *stack_top-- = 0x10;
-  *stack_top-- = (uint64_t)stack_top;
-  *stack_top-- = 0x202;
-  *stack_top-- = 0x08;
-  *stack_top-- = (uint64_t)idle_task;
 
+  // Initialize context for first switch
+  memset(&idle_process->context, 0, sizeof(context_t));
   idle_process->context.rsp = (uint64_t)stack_top;
   idle_process->context.rip = (uint64_t)idle_task;
-  idle_process->context.cs = 0x08;
-  idle_process->context.ss = 0x10;
-  idle_process->context.rflags = 0x202;
+  idle_process->context.rflags = 0x202; // Interrupts enabled
 
   process_list_head = idle_process;
   current_process = idle_process;
@@ -95,22 +89,16 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
 
   uint64_t *stack_top =
       (uint64_t *)((uint8_t *)process->stack + KERNEL_STACK_SIZE);
-  stack_top--;
-  *stack_top-- = 0x10;
-  *stack_top-- = (uint64_t)stack_top;
-  *stack_top-- = 0x202;
-  *stack_top-- = 0x08;
-  *stack_top-- = (uint64_t)entry_point;
 
-  for (int i = 0; i < 15; i++) {
-    *stack_top-- = 0;
-  }
+  // Set up initial stack
+  // When context_switch loads this context, it will push RIP and then ret to it
+  // So we just need the stack pointer to be at the right place
 
-  process->context.rsp = (uint64_t)stack_top;
-  process->context.rip = (uint64_t)entry_point;
-  process->context.cs = 0x08;
-  process->context.ss = 0x10;
-  process->context.rflags = 0x202;
+  // Initialize context for first switch
+  memset(&process->context, 0, sizeof(context_t));
+  process->context.rsp = (uint64_t)stack_top;   // Stack pointer at top
+  process->context.rip = (uint64_t)entry_point; // Where to jump
+  process->context.rflags = 0x202;              // Interrupts enabled
 
   if (process_list_head) {
     process_t *last = process_list_head;
@@ -130,6 +118,11 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
   kprint("' with PID ");
   kprint_hex(process->pid);
   kprint("\n");
+
+  // Force a schedule to run the new process
+  if (scheduler_enabled) {
+    schedule();
+  }
 
   return process;
 }
@@ -262,8 +255,10 @@ void scheduler_tick(void) {
     return;
   }
 
+  // Update tick counts
   current_process->total_ticks++;
 
+  // Wake up sleeping processes
   process_t *p = process_list_head;
   while (p) {
     if (p->state == PROCESS_STATE_BLOCKED && p->ticks_remaining > 0) {
@@ -275,9 +270,11 @@ void scheduler_tick(void) {
     p = p->next;
   }
 
+  // Decrement time slice and schedule if needed
   if (current_process->state == PROCESS_STATE_RUNNING) {
     current_process->ticks_remaining--;
     if (current_process->ticks_remaining == 0) {
+      // Time slice expired, schedule next process
       schedule();
     }
   }
@@ -288,13 +285,18 @@ void schedule(void) {
     return;
   }
 
+  // Disable interrupts during scheduling
+  asm volatile("cli");
+
   process_t *old_process = current_process;
   process_t *next_process = NULL;
 
+  // Mark current as ready if it was running
   if (old_process && old_process->state == PROCESS_STATE_RUNNING) {
     old_process->state = PROCESS_STATE_READY;
   }
 
+  // Find next ready process (round-robin)
   process_t *p = old_process ? old_process->next : process_list_head;
   if (!p) {
     p = process_list_head;
@@ -312,22 +314,30 @@ void schedule(void) {
     }
   } while (p != start);
 
+  // If no ready process, use idle
   if (!next_process) {
     next_process = idle_process;
   }
 
+  // If same process, just continue
   if (next_process == old_process) {
     if (old_process->state == PROCESS_STATE_READY) {
       old_process->state = PROCESS_STATE_RUNNING;
       old_process->ticks_remaining = old_process->time_slice;
     }
+    asm volatile("sti");
     return;
   }
 
+  // Switch to next process
   next_process->state = PROCESS_STATE_RUNNING;
   next_process->ticks_remaining = next_process->time_slice;
   current_process = next_process;
 
+  // Re-enable interrupts
+  asm volatile("sti");
+
+  // Perform context switch
   if (old_process && next_process) {
     context_switch(&old_process->context, &next_process->context);
   }

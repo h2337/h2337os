@@ -7,11 +7,11 @@ global context_switch
 ; RDI = old context pointer
 ; RSI = new context pointer
 context_switch:
-    ; Save current context
+    ; Save old context if provided
     test rdi, rdi
     jz .load_new
     
-    ; Save general purpose registers
+    ; Save all general purpose registers
     mov [rdi + 0x00], r15
     mov [rdi + 0x08], r14
     mov [rdi + 0x10], r13
@@ -21,37 +21,37 @@ context_switch:
     mov [rdi + 0x30], r9
     mov [rdi + 0x38], r8
     mov [rdi + 0x40], rbp
-    mov [rdi + 0x48], rdi
-    mov [rdi + 0x50], rsi
+    ; Save original RDI and RSI
+    mov rax, rdi
+    mov [rdi + 0x48], rax
+    mov rax, rsi  
+    mov [rdi + 0x50], rax
     mov [rdi + 0x58], rdx
     mov [rdi + 0x60], rcx
     mov [rdi + 0x68], rbx
-    mov [rdi + 0x70], rax
     
-    ; Save RIP (return address)
+    ; Save return address (where we'll return to after switch)
     mov rax, [rsp]
     mov [rdi + 0x78], rax
     
-    ; Save stack pointer
+    ; Save stack pointer (pointing after return address)
     lea rax, [rsp + 8]
     mov [rdi + 0x90], rax
     
-    ; Save flags
+    ; Save RFLAGS
     pushfq
-    pop rax
-    mov [rdi + 0x88], rax
+    pop qword [rdi + 0x88]
 
 .load_new:
-    ; Load new context
+    ; Load new context if provided
     test rsi, rsi
     jz .done
     
-    ; Load stack pointer first
+    ; Load stack pointer
     mov rsp, [rsi + 0x90]
     
-    ; Load flags
-    mov rax, [rsi + 0x88]
-    push rax
+    ; Load RFLAGS
+    push qword [rsi + 0x88]
     popfq
     
     ; Load general purpose registers
@@ -68,14 +68,15 @@ context_switch:
     mov rdx, [rsi + 0x58]
     mov rcx, [rsi + 0x60]
     mov rbx, [rsi + 0x68]
-    mov rax, [rsi + 0x70]
     
-    ; Push return address
-    mov rsi, [rsi + 0x78]
-    push rsi
+    ; Push return address onto stack
+    push qword [rsi + 0x78]
     
     ; Load RSI last
-    mov rsi, [rsp - 0x40]
+    mov rsi, [rsi + 0x50]
+    
+    ; Return to the saved RIP
+    ret
 
 .done:
     ret
