@@ -44,7 +44,6 @@ void kmain(void) {
       framebuffer_request.response->framebuffers[0];
 
   console_init(framebuffer);
-  kprint("Hello, World!\n");
 
   hcf();
 }

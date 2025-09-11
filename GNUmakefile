@@ -1,6 +1,6 @@
 .SUFFIXES:
 
-QEMUFLAGS := -m 2G
+QEMUFLAGS := -m 2G -serial stdio
 override IMAGE_NAME := h2337os
 
 HOST_CC := cc
