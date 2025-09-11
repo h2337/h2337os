@@ -3,6 +3,7 @@
 #include "heap.h"
 #include "libc.h"
 #include "pit.h"
+#include "types.h"
 #include "vfs.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -86,6 +87,25 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
   process->time_slice = DEFAULT_TIME_SLICE;
   process->ticks_remaining = DEFAULT_TIME_SLICE;
 
+  // Initialize file descriptor table
+  for (int i = 0; i < 256; i++) {
+    process->fd_table[i] = -1;
+  }
+  // Set up standard file descriptors
+  process->fd_table[0] = 0; // stdin
+  process->fd_table[1] = 1; // stdout
+  process->fd_table[2] = 2; // stderr
+
+  // Initialize memory management
+  process->brk = (void *)0x10000000; // Start heap at 256MB
+  process->brk_start = process->brk;
+
+  // Initialize process relationships
+  process->parent = current_process;
+  process->children = NULL;
+  process->sibling = NULL;
+  process->exit_status = 0;
+
   process->stack_size = KERNEL_STACK_SIZE;
   process->stack = kmalloc(KERNEL_STACK_SIZE);
   if (!process->stack) {
@@ -163,10 +183,28 @@ void process_destroy(process_t *process) {
 }
 
 void process_exit(int exit_code) {
-  (void)exit_code;
-
   if (current_process && current_process != idle_process) {
-    current_process->state = PROCESS_STATE_TERMINATED;
+    current_process->exit_status = exit_code;
+    current_process->state = PROCESS_STATE_ZOMBIE;
+
+    // Wake up parent if it's waiting
+    if (current_process->parent &&
+        current_process->parent->state == PROCESS_STATE_BLOCKED) {
+      current_process->parent->state = PROCESS_STATE_READY;
+    }
+
+    // Reparent children to init (process 1) or idle
+    process_t *child = current_process->children;
+    while (child) {
+      process_t *next = child->sibling;
+      child->parent = idle_process; // Or init process when available
+      child->ppid = idle_process->pid;
+      child->sibling = idle_process->children;
+      idle_process->children = child;
+      child = next;
+    }
+    current_process->children = NULL;
+
     schedule();
   }
 }
@@ -387,4 +425,145 @@ int process_set_cwd(const char *path) {
   }
 
   return 0;
+}
+
+process_t *process_fork(void) {
+  process_t *parent = current_process;
+  if (!parent)
+    return NULL;
+
+  process_t *child = kmalloc(sizeof(process_t));
+  if (!child)
+    return NULL;
+
+  // Copy parent process structure
+  memcpy(child, parent, sizeof(process_t));
+
+  // Assign new PID
+  child->pid = next_pid++;
+  child->ppid = parent->pid;
+
+  // Allocate and copy stack
+  child->stack = kmalloc(child->stack_size);
+  if (!child->stack) {
+    kfree(child);
+    return NULL;
+  }
+  memcpy(child->stack, parent->stack, child->stack_size);
+
+  // Update stack pointer to point to child's stack
+  uint64_t stack_offset = (uint64_t)child->stack - (uint64_t)parent->stack;
+  child->context.rsp += stack_offset;
+
+  // Reset process state
+  child->state = PROCESS_STATE_READY;
+  child->total_ticks = 0;
+  child->ticks_remaining = DEFAULT_TIME_SLICE;
+
+  // Set up process relationships
+  child->parent = parent;
+  child->children = NULL;
+  child->sibling = parent->children;
+  parent->children = child;
+
+  // Add to process list
+  if (process_list_head) {
+    process_t *last = process_list_head;
+    while (last->next) {
+      last = last->next;
+    }
+    last->next = child;
+    child->prev = last;
+    child->next = NULL;
+  }
+
+  process_count++;
+
+  return child;
+}
+
+int process_waitpid(int pid, int *status, int options) {
+  (void)options; // Unused for now
+
+  process_t *parent = current_process;
+  if (!parent)
+    return -1;
+
+  while (1) {
+    // Check if specific child or any child
+    process_t *child = parent->children;
+    process_t *prev = NULL;
+
+    while (child) {
+      if ((pid == -1 || child->pid == (uint32_t)pid) &&
+          child->state == PROCESS_STATE_ZOMBIE) {
+        // Found a zombie child
+        if (status) {
+          *status = child->exit_status;
+        }
+
+        // Remove from children list
+        if (prev) {
+          prev->sibling = child->sibling;
+        } else {
+          parent->children = child->sibling;
+        }
+
+        // Remove from process list
+        if (child->prev) {
+          child->prev->next = child->next;
+        } else {
+          process_list_head = child->next;
+        }
+        if (child->next) {
+          child->next->prev = child->prev;
+        }
+
+        uint32_t child_pid = child->pid;
+
+        // Free child resources
+        if (child->stack) {
+          kfree(child->stack);
+        }
+        kfree(child);
+        process_count--;
+
+        return child_pid;
+      }
+      prev = child;
+      child = child->sibling;
+    }
+
+    // No zombie children found, block
+    parent->state = PROCESS_STATE_BLOCKED;
+    process_yield();
+  }
+}
+
+void *process_sbrk(intptr_t increment) {
+  process_t *proc = current_process;
+  if (!proc)
+    return (void *)-1;
+
+  void *old_brk = proc->brk;
+
+  if (increment == 0) {
+    return old_brk;
+  }
+
+  // Calculate new break
+  void *new_brk = (char *)proc->brk + increment;
+
+  // Simple bounds check (you might want more sophisticated checks)
+  if (new_brk < proc->brk_start) {
+    return (void *)-1;
+  }
+
+  // Check for overflow or too large allocation
+  if ((uintptr_t)new_brk > 0x20000000) { // Limit to 512MB for now
+    return (void *)-1;
+  }
+
+  proc->brk = new_brk;
+  return old_brk;
 }
