@@ -4,6 +4,7 @@
 #include "heap.h"
 #include "keyboard.h"
 #include "libc.h"
+#include "pci.h"
 #include "pit.h"
 #include "pmm.h"
 #include "process.h"
@@ -44,6 +45,7 @@ static int cmd_pwd(int argc, char **argv);
 static int cmd_cd(int argc, char **argv);
 static int cmd_usermode(int argc, char **argv);
 static int cmd_exec(int argc, char **argv);
+static int cmd_lspci(int argc, char **argv);
 
 static shell_command_t shell_commands[] = {
     {"help", "Display available commands", cmd_help},
@@ -71,6 +73,7 @@ static shell_command_t shell_commands[] = {
     {"cd", "Change directory", cmd_cd},
     {"usermode", "Test user mode", cmd_usermode},
     {"exec", "Execute an ELF binary", cmd_exec},
+    {"lspci", "List PCI devices", cmd_lspci},
     {NULL, NULL, NULL}};
 
 static int cmd_help(int argc, char **argv) {
@@ -1028,5 +1031,17 @@ static int cmd_exec(int argc, char **argv) {
   }
 
   // Success! The program was executed
+  return 0;
+}
+
+static int cmd_lspci(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+
+  kprint("Scanning PCI bus...\n");
+  pci_scan_bus();
+  kprint("\n");
+  pci_list_devices();
+
   return 0;
 }

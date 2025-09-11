@@ -54,3 +54,45 @@ void kprint_hex(uint64_t value) {
 
   kprint(buffer);
 }
+
+void kprint_hex8(uint8_t value) {
+  char hex_chars[] = "0123456789ABCDEF";
+  char buffer[3];
+
+  buffer[0] = hex_chars[(value >> 4) & 0xF];
+  buffer[1] = hex_chars[value & 0xF];
+  buffer[2] = '\0';
+
+  kprint(buffer);
+}
+
+void kprint_hex16(uint16_t value) {
+  char hex_chars[] = "0123456789ABCDEF";
+  char buffer[5];
+
+  buffer[0] = hex_chars[(value >> 12) & 0xF];
+  buffer[1] = hex_chars[(value >> 8) & 0xF];
+  buffer[2] = hex_chars[(value >> 4) & 0xF];
+  buffer[3] = hex_chars[value & 0xF];
+  buffer[4] = '\0';
+
+  kprint(buffer);
+}
+
+void kprint_dec(uint32_t value) {
+  char buffer[11]; // Max 10 digits + null terminator
+  int i = 10;
+
+  buffer[i] = '\0';
+
+  if (value == 0) {
+    buffer[--i] = '0';
+  } else {
+    while (value > 0 && i > 0) {
+      buffer[--i] = '0' + (value % 10);
+      value /= 10;
+    }
+  }
+
+  kprint(&buffer[i]);
+}
