@@ -38,6 +38,8 @@ static int cmd_write(int argc, char **argv);
 static int cmd_mkdir(int argc, char **argv);
 static int cmd_rm(int argc, char **argv);
 static int cmd_touch(int argc, char **argv);
+static int cmd_pwd(int argc, char **argv);
+static int cmd_cd(int argc, char **argv);
 
 static shell_command_t shell_commands[] = {
     {"help", "Display available commands", cmd_help},
@@ -61,6 +63,8 @@ static shell_command_t shell_commands[] = {
     {"mkdir", "Create a directory", cmd_mkdir},
     {"rm", "Remove a file", cmd_rm},
     {"touch", "Create an empty file", cmd_touch},
+    {"pwd", "Print working directory", cmd_pwd},
+    {"cd", "Change directory", cmd_cd},
     {NULL, NULL, NULL}};
 
 static int cmd_help(int argc, char **argv) {
@@ -554,8 +558,16 @@ void shell_init(void) {
   kprint("\n");
 }
 
-void shell_run(void) {
+static void shell_print_prompt(void) {
+  const char *cwd = process_get_cwd();
+  kprint("[");
+  kprint(cwd);
+  kprint("] ");
   kprint(SHELL_PROMPT);
+}
+
+void shell_run(void) {
+  shell_print_prompt();
 
   while (1) {
     if (keyboard_has_input()) {
@@ -572,7 +584,7 @@ void shell_run(void) {
 
         buffer_pos = 0;
         memset(shell_buffer, 0, SHELL_BUFFER_SIZE);
-        kprint(SHELL_PROMPT);
+        shell_print_prompt();
 
       } else if (c == '\b') {
         if (buffer_pos > 0) {
@@ -626,21 +638,22 @@ void shell_run(void) {
 }
 
 static int cmd_ls(int argc, char **argv) {
-  (void)argc;
-  (void)argv;
-
-  vfs_node_t *dir = vfs_get_root();
-  if (!dir) {
-    kprint("Error: No filesystem mounted\n");
-    return 1;
-  }
+  vfs_node_t *dir;
 
   if (argc > 1) {
+    // Use provided path
     dir = vfs_resolve_path(argv[1]);
     if (!dir) {
       kprint("Error: Directory not found: ");
       kprint(argv[1]);
       kprint("\n");
+      return 1;
+    }
+  } else {
+    // No argument - use current directory
+    dir = vfs_resolve_path(".");
+    if (!dir) {
+      kprint("Error: Cannot access current directory\n");
       return 1;
     }
   }
@@ -788,8 +801,9 @@ static int cmd_mkdir(int argc, char **argv) {
     *last_slash = '\0';
     parent = vfs_resolve_path(dirpath);
   } else {
+    // No slash means create in current directory
     strcpy(dirname, argv[1]);
-    parent = vfs_get_root();
+    parent = vfs_resolve_path(".");
   }
 
   if (!parent) {
@@ -833,8 +847,9 @@ static int cmd_rm(int argc, char **argv) {
     *last_slash = '\0';
     parent = vfs_resolve_path(filepath);
   } else {
+    // No slash means remove from current directory
     strcpy(filename, argv[1]);
-    parent = vfs_get_root();
+    parent = vfs_resolve_path(".");
   }
 
   if (!parent) {
@@ -874,5 +889,35 @@ static int cmd_touch(int argc, char **argv) {
   kprint("Created file: ");
   kprint(argv[1]);
   kprint("\n");
+  return 0;
+}
+
+static int cmd_pwd(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+
+  const char *cwd = process_get_cwd();
+  kprint(cwd);
+  kprint("\n");
+  return 0;
+}
+
+static int cmd_cd(int argc, char **argv) {
+  if (argc < 2) {
+    // No argument means go to root
+    if (process_set_cwd("/") < 0) {
+      kprint("Error: Cannot change to root directory\n");
+      return 1;
+    }
+    return 0;
+  }
+
+  if (process_set_cwd(argv[1]) < 0) {
+    kprint("Error: Cannot change directory to: ");
+    kprint(argv[1]);
+    kprint("\n");
+    return 1;
+  }
+
   return 0;
 }

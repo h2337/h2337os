@@ -3,6 +3,7 @@
 #include "heap.h"
 #include "libc.h"
 #include "pit.h"
+#include "vfs.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -34,6 +35,7 @@ void process_init(void) {
   idle_process->pid = 0;
   idle_process->ppid = 0;
   strcpy(idle_process->name, "idle");
+  strcpy(idle_process->cwd, "/"); // Set root as default cwd
   idle_process->state = PROCESS_STATE_READY;
   idle_process->time_slice = DEFAULT_TIME_SLICE;
   idle_process->ticks_remaining = DEFAULT_TIME_SLICE;
@@ -74,6 +76,12 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
   process->ppid = current_process ? current_process->pid : 0;
   strncpy(process->name, name, 63);
   process->name[63] = '\0';
+  // Inherit parent's working directory
+  if (current_process) {
+    strcpy(process->cwd, current_process->cwd);
+  } else {
+    strcpy(process->cwd, "/");
+  }
   process->state = PROCESS_STATE_READY;
   process->time_slice = DEFAULT_TIME_SLICE;
   process->ticks_remaining = DEFAULT_TIME_SLICE;
@@ -341,4 +349,42 @@ void schedule(void) {
   if (old_process && next_process) {
     context_switch(&old_process->context, &next_process->context);
   }
+}
+
+const char *process_get_cwd(void) {
+  if (!current_process) {
+    return "/";
+  }
+  return current_process->cwd;
+}
+
+int process_set_cwd(const char *path) {
+  if (!current_process) {
+    return -1;
+  }
+
+  // Verify the path exists and is a directory
+  vfs_node_t *node = vfs_resolve_path(path);
+  if (!node) {
+    return -1; // Path doesn't exist
+  }
+
+  if (!(node->type & VFS_DIRECTORY)) {
+    return -1; // Not a directory
+  }
+
+  // Update the current working directory
+  strncpy(current_process->cwd, path, MAX_PATH_LENGTH - 1);
+  current_process->cwd[MAX_PATH_LENGTH - 1] = '\0';
+
+  // Ensure path ends with / for directories (except root)
+  size_t len = strlen(current_process->cwd);
+  if (len > 1 && current_process->cwd[len - 1] != '/') {
+    if (len < MAX_PATH_LENGTH - 1) {
+      current_process->cwd[len] = '/';
+      current_process->cwd[len + 1] = '\0';
+    }
+  }
+
+  return 0;
 }

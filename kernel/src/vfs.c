@@ -2,6 +2,7 @@
 #include "console.h"
 #include "heap.h"
 #include "libc.h"
+#include "process.h"
 #include <stddef.h>
 
 static vfs_node_t *vfs_root = NULL;
@@ -122,17 +123,95 @@ int vfs_unmount(const char *mountpoint) {
   return -1;
 }
 
+static char *vfs_normalize_path(const char *path, char *normalized) {
+  char fullpath[VFS_MAX_PATH];
+
+  // Check if path is absolute or relative
+  if (path[0] == '/') {
+    strcpy(fullpath, path);
+  } else {
+    // Relative path - prepend current working directory
+    const char *cwd = process_get_cwd();
+    strcpy(fullpath, cwd);
+
+    // Ensure cwd ends with /
+    size_t cwd_len = strlen(fullpath);
+    if (cwd_len > 1 && fullpath[cwd_len - 1] != '/') {
+      strcat(fullpath, "/");
+    }
+
+    strcat(fullpath, path);
+  }
+
+  // Now normalize the path (handle . and ..)
+  char *src = fullpath;
+  char *dst = normalized;
+  *dst++ = '/';
+
+  while (*src) {
+    if (*src == '/') {
+      src++;
+      continue;
+    }
+
+    if (*src == '.') {
+      if (src[1] == '/' || src[1] == '\0') {
+        // Skip "./" or trailing "."
+        src++;
+        if (*src == '/')
+          src++;
+        continue;
+      } else if (src[1] == '.' && (src[2] == '/' || src[2] == '\0')) {
+        // Handle ".." - go back one directory
+        src += 2;
+        if (*src == '/')
+          src++;
+
+        // Remove last directory from dst
+        if (dst > normalized + 1) {
+          dst--; // Skip the trailing /
+          while (dst > normalized && *(dst - 1) != '/') {
+            dst--;
+          }
+        }
+        continue;
+      }
+    }
+
+    // Copy normal path component
+    while (*src && *src != '/') {
+      *dst++ = *src++;
+    }
+
+    if (*src == '/') {
+      *dst++ = '/';
+      src++;
+    }
+  }
+
+  // Remove trailing slash unless it's root
+  if (dst > normalized + 1 && *(dst - 1) == '/') {
+    dst--;
+  }
+
+  *dst = '\0';
+  return normalized;
+}
+
 vfs_node_t *vfs_resolve_path(const char *path) {
   if (!path || !vfs_root) {
     return NULL;
   }
 
-  if (path[0] == '/' && path[1] == '\0') {
+  char normalized[VFS_MAX_PATH];
+  vfs_normalize_path(path, normalized);
+
+  if (normalized[0] == '/' && normalized[1] == '\0') {
     return vfs_root;
   }
 
   char pathcopy[VFS_MAX_PATH];
-  strcpy(pathcopy, path);
+  strcpy(pathcopy, normalized);
 
   vfs_node_t *current = vfs_root;
   char *token = strtok(pathcopy, "/");
@@ -153,10 +232,13 @@ vfs_node_t *vfs_open(const char *path, uint32_t flags) {
   vfs_node_t *node = vfs_resolve_path(path);
 
   if (!node && (flags & VFS_CREATE)) {
+    char normalized[VFS_MAX_PATH];
+    vfs_normalize_path(path, normalized);
+
     char dirpath[VFS_MAX_PATH];
     char filename[VFS_MAX_NAME];
 
-    strcpy(dirpath, path);
+    strcpy(dirpath, normalized);
     char *last_slash = NULL;
     for (char *p = dirpath; *p; p++) {
       if (*p == '/') {
@@ -168,10 +250,14 @@ vfs_node_t *vfs_open(const char *path, uint32_t flags) {
     if (last_slash) {
       strcpy(filename, last_slash + 1);
       *last_slash = '\0';
-      parent = vfs_resolve_path(dirpath);
+      if (dirpath[0] == '\0') {
+        parent = vfs_root;
+      } else {
+        parent = vfs_resolve_path(dirpath);
+      }
     } else {
-      // No slash means create in root directory
-      strcpy(filename, path);
+      // This shouldn't happen after normalization, but handle it
+      strcpy(filename, normalized);
       parent = vfs_root;
     }
 

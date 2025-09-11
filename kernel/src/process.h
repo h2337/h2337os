@@ -7,6 +7,7 @@
 #define MAX_PROCESSES 256
 #define KERNEL_STACK_SIZE 8192
 #define DEFAULT_TIME_SLICE 10
+#define MAX_PATH_LENGTH 256
 
 typedef enum {
   PROCESS_STATE_READY,
@@ -43,6 +44,7 @@ typedef struct process {
   uint32_t pid;
   uint32_t ppid;
   char name[64];
+  char cwd[MAX_PATH_LENGTH]; // Current working directory
   process_state_t state;
   context_t context;
   uint64_t *stack;
@@ -65,6 +67,8 @@ process_t *process_get_current(void);
 process_t *process_get_by_pid(uint32_t pid);
 void process_list(void);
 uint32_t process_get_count(void);
+const char *process_get_cwd(void);
+int process_set_cwd(const char *path);
 void scheduler_init(void);
 void scheduler_tick(void);
 void schedule(void);
