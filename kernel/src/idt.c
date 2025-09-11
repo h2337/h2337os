@@ -2,6 +2,7 @@
 #include "console.h"
 #include "keyboard.h"
 #include "pic.h"
+#include "pit.h"
 #include <stddef.h>
 
 static struct idt_entry idt[256];
@@ -108,7 +109,9 @@ static void load_idt(void) {
 }
 
 void irq_handler(struct interrupt_frame *frame) {
-  if (frame->int_no == 33) {
+  if (frame->int_no == 32) {
+    pit_handler();
+  } else if (frame->int_no == 33) {
     keyboard_handler();
   } else {
     pic_send_eoi(frame->int_no - 32);

@@ -3,6 +3,7 @@
 #include "heap.h"
 #include "keyboard.h"
 #include "libc.h"
+#include "pit.h"
 #include "pmm.h"
 #include "vmm.h"
 #include <stdbool.h>
@@ -24,6 +25,8 @@ static int cmd_test(int argc, char **argv);
 static int cmd_about(int argc, char **argv);
 static int cmd_uptime(int argc, char **argv);
 static int cmd_hex(int argc, char **argv);
+static int cmd_sleep(int argc, char **argv);
+static int cmd_timer(int argc, char **argv);
 
 static shell_command_t shell_commands[] = {
     {"help", "Display available commands", cmd_help},
@@ -36,11 +39,9 @@ static shell_command_t shell_commands[] = {
     {"about", "Display system information", cmd_about},
     {"uptime", "Display system uptime", cmd_uptime},
     {"hex", "Display hexadecimal value", cmd_hex},
+    {"sleep", "Sleep for specified milliseconds", cmd_sleep},
+    {"timer", "Display timer information", cmd_timer},
     {NULL, NULL, NULL}};
-
-static uint64_t system_ticks = 0;
-
-void pit_handler(void) { system_ticks++; }
 
 static int cmd_help(int argc, char **argv) {
   (void)argc;
@@ -210,9 +211,31 @@ static int cmd_uptime(int argc, char **argv) {
   (void)argc;
   (void)argv;
 
+  uint64_t seconds = pit_get_seconds();
+  uint64_t minutes = seconds / 60;
+  uint64_t hours = minutes / 60;
+  uint64_t days = hours / 24;
+
   kprint("System uptime: ");
-  kprint_hex(system_ticks);
-  kprint(" ticks\n");
+  if (days > 0) {
+    kprint_hex(days);
+    kprint(" days, ");
+  }
+  if (hours > 0) {
+    kprint_hex(hours % 24);
+    kprint(" hours, ");
+  }
+  if (minutes > 0) {
+    kprint_hex(minutes % 60);
+    kprint(" minutes, ");
+  }
+  kprint_hex(seconds % 60);
+  kprint(" seconds\n");
+
+  kprint("Total ticks: ");
+  kprint_hex(pit_get_ticks());
+  kprint("\n");
+
   return 0;
 }
 
@@ -239,6 +262,59 @@ static int cmd_hex(int argc, char **argv) {
   kprint(argv[1]);
   kprint("\nHexadecimal: 0x");
   kprint_hex(value);
+  kprint("\n");
+
+  return 0;
+}
+
+static int cmd_sleep(int argc, char **argv) {
+  if (argc < 2) {
+    kprint("Usage: sleep <milliseconds>\n");
+    return 1;
+  }
+
+  uint32_t ms = 0;
+  char *str = argv[1];
+
+  while (*str) {
+    if (*str >= '0' && *str <= '9') {
+      ms = ms * 10 + (*str - '0');
+    } else {
+      kprint("Invalid number\n");
+      return 1;
+    }
+    str++;
+  }
+
+  kprint("Sleeping for ");
+  kprint_hex(ms);
+  kprint(" milliseconds...\n");
+
+  pit_sleep(ms);
+
+  kprint("Done!\n");
+  return 0;
+}
+
+static int cmd_timer(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+
+  kprint("Timer Information:\n");
+  kprint("  Frequency: ");
+  kprint_hex(PIT_DEFAULT_FREQUENCY);
+  kprint(" Hz\n");
+
+  kprint("  Current ticks: ");
+  kprint_hex(pit_get_ticks());
+  kprint("\n");
+
+  kprint("  Milliseconds: ");
+  kprint_hex(pit_get_milliseconds());
+  kprint("\n");
+
+  kprint("  Seconds: ");
+  kprint_hex(pit_get_seconds());
   kprint("\n");
 
   return 0;

@@ -7,6 +7,7 @@
 #include "keyboard.h"
 #include "limine_requests.h"
 #include "pic.h"
+#include "pit.h"
 #include "pmm.h"
 #include "shell.h"
 #include "vmm.h"
@@ -41,6 +42,7 @@ void kmain(void) {
   gdt_init();
   idt_init();
   pic_init();
+  pit_init();
 
   kprint("Initializing memory management...\n");
   pmm_init();
