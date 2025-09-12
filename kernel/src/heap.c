@@ -2,6 +2,7 @@
 #include "console.h"
 #include "libc.h"
 #include "pmm.h"
+#include "sync.h"
 #include "vmm.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -23,6 +24,9 @@ typedef struct heap_block {
 static heap_block_t *heap_start = NULL;
 static uint64_t heap_end = 0;
 static size_t heap_size = 0;
+
+// Synchronization for heap operations
+static spinlock_t heap_lock = SPINLOCK_INIT("heap");
 
 static void expand_heap(size_t amount) {
   size_t pages_needed = (amount + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -122,6 +126,9 @@ void *kmalloc(size_t size) {
 
   size = (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 
+  // Lock heap for allocation
+  spin_lock(&heap_lock);
+
   heap_block_t *block = find_free_block(size);
 
   if (block == NULL) {
@@ -151,6 +158,7 @@ void *kmalloc(size_t size) {
 
     block = find_free_block(size);
     if (block == NULL) {
+      spin_unlock(&heap_lock);
       return NULL;
     }
   }
@@ -158,6 +166,7 @@ void *kmalloc(size_t size) {
   split_block(block, size);
   block->free = 0;
 
+  spin_unlock(&heap_lock);
   return (void *)((uint8_t *)block + sizeof(heap_block_t));
 }
 
@@ -173,8 +182,11 @@ void kfree(void *ptr) {
     return;
   }
 
+  // Lock heap for deallocation
+  spin_lock(&heap_lock);
   block->free = 1;
   merge_free_blocks(block);
+  spin_unlock(&heap_lock);
 }
 
 void *kcalloc(size_t num, size_t size) {

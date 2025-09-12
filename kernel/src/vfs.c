@@ -3,6 +3,7 @@
 #include "heap.h"
 #include "libc.h"
 #include "process.h"
+#include "sync.h"
 #include <stddef.h>
 
 static vfs_node_t *vfs_root = NULL;
@@ -10,6 +11,10 @@ static vfs_filesystem_t *filesystems = NULL;
 static vfs_mount_t *mount_points = NULL;
 static vfs_file_t open_files[VFS_MAX_OPEN_FILES];
 static int next_fd = 3;
+
+// Synchronization for VFS operations
+static spinlock_t vfs_lock = SPINLOCK_INIT("vfs");
+static spinlock_t fd_lock = SPINLOCK_INIT("fd_table");
 
 void vfs_init(void) {
   kprint("Initializing Virtual File System...\n");
@@ -331,6 +336,10 @@ int vfs_open_fd(const char *path, uint32_t flags) {
     return -1;
   }
 
+  // Lock the file descriptor table
+  spin_lock(&fd_lock);
+
+  int result_fd = -1;
   for (int i = 0; i < VFS_MAX_OPEN_FILES; i++) {
     if (!open_files[i].in_use) {
       open_files[i].node = node;
@@ -338,22 +347,31 @@ int vfs_open_fd(const char *path, uint32_t flags) {
       open_files[i].flags = flags;
       open_files[i].fd = next_fd++;
       open_files[i].in_use = 1;
-      return open_files[i].fd;
+      result_fd = open_files[i].fd;
+      break;
     }
   }
 
-  vfs_close(node);
-  return -1;
+  spin_unlock(&fd_lock);
+
+  if (result_fd == -1) {
+    vfs_close(node);
+  }
+  return result_fd;
 }
 
 void vfs_close_fd(int fd) {
+  spin_lock(&fd_lock);
   for (int i = 0; i < VFS_MAX_OPEN_FILES; i++) {
     if (open_files[i].in_use && open_files[i].fd == fd) {
-      vfs_close(open_files[i].node);
+      vfs_node_t *node = open_files[i].node;
       open_files[i].in_use = 0;
+      spin_unlock(&fd_lock);
+      vfs_close(node); // Call vfs_close outside of lock to avoid deadlock
       return;
     }
   }
+  spin_unlock(&fd_lock);
 }
 
 uint32_t vfs_read_fd(int fd, uint8_t *buffer, uint32_t size) {

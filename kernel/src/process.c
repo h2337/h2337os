@@ -3,6 +3,7 @@
 #include "heap.h"
 #include "libc.h"
 #include "pit.h"
+#include "sync.h"
 #include "types.h"
 #include "vfs.h"
 #include <stddef.h>
@@ -14,6 +15,11 @@ static process_t *idle_process = NULL;
 static uint32_t next_pid = 1;
 static uint32_t process_count = 0;
 static int scheduler_enabled = 0;
+
+// Synchronization for process management
+static spinlock_t process_list_lock = SPINLOCK_INIT("process_list");
+static spinlock_t pid_counter_lock = SPINLOCK_INIT("pid_counter");
+static spinlock_t scheduler_lock = SPINLOCK_INIT("scheduler");
 
 extern void context_switch(context_t *old, context_t *new);
 
@@ -73,7 +79,12 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
   }
 
   memset(process, 0, sizeof(process_t));
+
+  // Safely allocate PID with lock
+  spin_lock(&pid_counter_lock);
   process->pid = next_pid++;
+  spin_unlock(&pid_counter_lock);
+
   process->ppid = current_process ? current_process->pid : 0;
   strncpy(process->name, name, 63);
   process->name[63] = '\0';
@@ -128,6 +139,8 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
   process->context.rip = (uint64_t)entry_point; // Where to jump
   process->context.rflags = 0x202;              // Interrupts enabled
 
+  // Add to process list with lock
+  spin_lock(&process_list_lock);
   if (process_list_head) {
     process_t *last = process_list_head;
     while (last->next) {
@@ -138,8 +151,8 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
   } else {
     process_list_head = process;
   }
-
   process_count++;
+  spin_unlock(&process_list_lock);
 
   kprint("Created process '");
   kprint(name);
@@ -164,6 +177,8 @@ void process_destroy(process_t *process) {
     process->state = PROCESS_STATE_TERMINATED;
   }
 
+  // Lock process list while removing process
+  spin_lock(&process_list_lock);
   if (process->prev) {
     process->prev->next = process->next;
   }
@@ -173,13 +188,15 @@ void process_destroy(process_t *process) {
   if (process == process_list_head) {
     process_list_head = process->next;
   }
+  process_count--;
+  spin_unlock(&process_list_lock);
 
+  // Free resources outside of lock
   if (process->stack) {
     kfree(process->stack);
   }
 
   kfree(process);
-  process_count--;
 }
 
 void process_exit(int exit_code) {
@@ -331,8 +348,11 @@ void schedule(void) {
     return;
   }
 
-  // Disable interrupts during scheduling
-  asm volatile("cli");
+  // Use IRQ-safe spinlock (disables interrupts automatically)
+  irq_state_t flags = spin_lock_irqsave(&scheduler_lock);
+
+  // Also lock the process list while we're traversing it
+  spin_lock(&process_list_lock);
 
   process_t *old_process = current_process;
   process_t *next_process = NULL;
@@ -371,7 +391,8 @@ void schedule(void) {
       old_process->state = PROCESS_STATE_RUNNING;
       old_process->ticks_remaining = old_process->time_slice;
     }
-    asm volatile("sti");
+    spin_unlock(&process_list_lock);
+    spin_unlock_irqrestore(&scheduler_lock, flags);
     return;
   }
 
@@ -380,8 +401,8 @@ void schedule(void) {
   next_process->ticks_remaining = next_process->time_slice;
   current_process = next_process;
 
-  // Re-enable interrupts
-  asm volatile("sti");
+  spin_unlock(&process_list_lock);
+  spin_unlock_irqrestore(&scheduler_lock, flags);
 
   // Perform context switch
   if (old_process && next_process) {
