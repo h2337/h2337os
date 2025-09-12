@@ -6,7 +6,6 @@ h2337os is a 64-bit operating system written from scratch in C for x86_64 archit
 - **Physical Memory Manager (PMM)**: Page-based allocation with bitmap tracking
 - **Virtual Memory Manager (VMM)**: 4-level paging with kernel/user space separation
 - **Dynamic Heap Allocator**: kmalloc/kfree/kcalloc/krealloc implementation
-- **Memory-mapped I/O** support for hardware devices
 
 ### Process Management
 - **Multi-process support**: Up to 256 concurrent processes
