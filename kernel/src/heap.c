@@ -8,7 +8,8 @@
 #include <stdint.h>
 
 #define HEAP_START 0xFFFF900000000000
-#define HEAP_INITIAL_SIZE (16 * 1024 * 1024)
+#define HEAP_INITIAL_SIZE (4 * 1024 * 1024)
+#define HEAP_GROW_CHUNK (4 * 1024 * 1024)
 #define HEAP_MAGIC 0xDEADBEEF
 #define MIN_BLOCK_SIZE 32
 #define ALIGNMENT 16
@@ -25,17 +26,27 @@ static heap_block_t *heap_start = NULL;
 static uint64_t heap_end = 0;
 static size_t heap_size = 0;
 
-// Synchronization for heap operations
 static spinlock_t heap_lock = SPINLOCK_INIT("heap");
 
 static void expand_heap(size_t amount) {
   size_t pages_needed = (amount + PAGE_SIZE - 1) / PAGE_SIZE;
+  size_t free_pages = pmm_get_free_pages();
+  if (free_pages < pages_needed) {
+    pages_needed = free_pages;
+  }
   page_table_t *kernel_pagemap = vmm_get_kernel_pagemap();
 
   for (size_t i = 0; i < pages_needed; i++) {
     void *phys_page = pmm_alloc(1);
     if (phys_page == NULL) {
       kprint("HEAP: Failed to allocate physical page\n");
+      kprint("HEAP: free pages: 0x");
+      kprint_hex(pmm_get_free_pages());
+      kprint(" used pages: 0x");
+      kprint_hex(pmm_get_used_pages());
+      kprint(" total pages: 0x");
+      kprint_hex(pmm_get_total_pages());
+      kprint("\n");
       return;
     }
 
@@ -126,16 +137,14 @@ void *kmalloc(size_t size) {
 
   size = (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 
-  // Lock heap for allocation
   spin_lock(&heap_lock);
 
   heap_block_t *block = find_free_block(size);
 
   if (block == NULL) {
     size_t needed = size + sizeof(heap_block_t);
-    size_t expand_amount = (needed > HEAP_INITIAL_SIZE / 4)
-                               ? needed + PAGE_SIZE
-                               : HEAP_INITIAL_SIZE / 4;
+    size_t expand_amount =
+        (needed > HEAP_GROW_CHUNK) ? needed + PAGE_SIZE : HEAP_GROW_CHUNK;
     expand_heap(expand_amount);
 
     heap_block_t *last = heap_start;
@@ -182,7 +191,6 @@ void kfree(void *ptr) {
     return;
   }
 
-  // Lock heap for deallocation
   spin_lock(&heap_lock);
   block->free = 1;
   merge_free_blocks(block);

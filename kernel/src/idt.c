@@ -3,6 +3,7 @@
 #include "keyboard.h"
 #include "pic.h"
 #include "pit.h"
+#include "smp.h"
 #include <stddef.h>
 
 static struct idt_entry idt[256];
@@ -57,6 +58,7 @@ extern void isr44(void);
 extern void isr45(void);
 extern void isr46(void);
 extern void isr47(void);
+extern void isr64(void);
 
 static const char *exception_messages[] = {"Division By Zero",
                                            "Debug",
@@ -113,8 +115,15 @@ void irq_handler(struct interrupt_frame *frame) {
     pit_handler();
   } else if (frame->int_no == 33) {
     keyboard_handler();
-  } else {
+  } else if (frame->int_no == LAPIC_TIMER_VECTOR) {
+    smp_handle_apic_timer(frame);
+  } else if (frame->int_no >= 32 && frame->int_no <= 47) {
     pic_send_eoi(frame->int_no - 32);
+  } else {
+    // Unknown IRQ source; acknowledge legacy PIC if applicable
+    if (frame->int_no >= 32 && frame->int_no <= 47) {
+      pic_send_eoi(frame->int_no - 32);
+    }
   }
 }
 
@@ -265,8 +274,11 @@ void idt_init(void) {
   idt_set_gate(45, (uint64_t)isr45, 0x08, 0x8E);
   idt_set_gate(46, (uint64_t)isr46, 0x08, 0x8E);
   idt_set_gate(47, (uint64_t)isr47, 0x08, 0x8E);
+  idt_set_gate(LAPIC_TIMER_VECTOR, (uint64_t)isr64, 0x08, 0x8E);
 
   load_idt();
 
   kprint("IDT initialized\n");
 }
+
+void idt_reload(void) { load_idt(); }

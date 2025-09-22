@@ -602,6 +602,7 @@ static void shell_print_prompt(void) {
   kprint(cwd);
   kprint("] ");
   kprint(SHELL_PROMPT);
+  kflush();
 }
 
 void shell_run(void) {
@@ -651,6 +652,7 @@ void shell_run(void) {
             strcpy(shell_buffer, shell_history[history_pos]);
             buffer_pos = strlen(shell_buffer);
             kprint(shell_buffer);
+            kflush();
 
           } else if (arrow == 'B') {
             for (size_t i = 0; i < buffer_pos; i++) {
@@ -662,6 +664,7 @@ void shell_run(void) {
               strcpy(shell_buffer, shell_history[history_pos]);
               buffer_pos = strlen(shell_buffer);
               kprint(shell_buffer);
+              kflush();
             } else if (history_pos < history_count) {
               history_pos = history_count;
               shell_buffer[0] = '\0';

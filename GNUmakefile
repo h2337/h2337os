@@ -30,6 +30,7 @@ run-uefi: ovmf/ovmf-code-x86_64.fd $(IMAGE_NAME).iso
 		-drive if=pflash,unit=0,format=raw,file=ovmf/ovmf-code-x86_64.fd,readonly=on \
 		-cdrom $(IMAGE_NAME).iso \
 		-boot d \
+		-smp 4 \
 		$(QEMUFLAGS)
 
 .PHONY: run-hdd

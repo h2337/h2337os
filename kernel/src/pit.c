@@ -3,6 +3,7 @@
 #include "idt.h"
 #include "pic.h"
 #include "process.h"
+#include "smp.h"
 #include <stdint.h>
 
 static volatile uint64_t timer_ticks = 0;
@@ -20,7 +21,9 @@ static inline uint8_t inb(uint16_t port) {
 
 void pit_handler(void) {
   timer_ticks++;
-  scheduler_tick();
+  if (!smp_is_active()) {
+    scheduler_tick();
+  }
   pic_send_eoi(0);
 }
 
@@ -60,12 +63,4 @@ void pit_sleep(uint32_t milliseconds) {
   }
 }
 
-void pit_init(void) {
-  pit_set_frequency(PIT_DEFAULT_FREQUENCY);
-
-  pic_clear_mask(0);
-
-  kprint("PIT initialized at ");
-  kprint_hex(timer_frequency);
-  kprint(" Hz\n");
-}
+void pit_init(void) { kprint("PIT init temporarily disabled\n"); }

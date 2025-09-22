@@ -7,6 +7,7 @@
 void console_init(struct limine_framebuffer *fb);
 void kprint(const char *str);
 void kputchar(char c);
+void kflush(void);
 char kgetchar(void);
 void kprint_hex(uint64_t value);
 void kprint_hex8(uint8_t value);

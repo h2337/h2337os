@@ -13,6 +13,7 @@
 #include "process.h"
 #include "ramdisk.h"
 #include "shell.h"
+#include "smp.h"
 #include "syscall.h"
 #include "usermode.h"
 #include "vfs.h"
@@ -56,11 +57,16 @@ void kmain(void) {
   vmm_init();
   heap_init();
 
+  kprint("\n=== Initializing SMP ===\n");
+  smp_init();
+
   kprint("\n=== Initializing Keyboard ===\n");
   keyboard_init();
 
   kprint("\n=== Initializing Process Management ===\n");
   process_init();
+
+  smp_resume_secondary_cpus();
 
   kprint("\n=== Initializing Filesystem ===\n");
   vfs_init();

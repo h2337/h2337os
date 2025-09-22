@@ -44,7 +44,7 @@ typedef struct process {
   uint32_t pid;
   uint32_t ppid;
   char name[64];
-  char cwd[MAX_PATH_LENGTH]; // Current working directory
+  char cwd[MAX_PATH_LENGTH];
   process_state_t state;
   context_t context;
   uint64_t *stack;
@@ -53,27 +53,23 @@ typedef struct process {
   uint64_t ticks_remaining;
   uint64_t total_ticks;
 
-  // Memory management
-  void *brk;       // Program break
-  void *brk_start; // Initial program break
+  void *brk;
+  void *brk_start;
 
-  // File descriptors
-  int fd_table[256]; // File descriptor table (-1 = unused)
+  int fd_table[256];
 
-  // Exit status
   int exit_status;
 
-  // Child process tracking
-  struct process *children; // Linked list of children
-  struct process *sibling;  // Next sibling in parent's children list
-  struct process *parent;   // Parent process
+  struct process *children;
+  struct process *sibling;
+  struct process *parent;
 
-  // Process list
   struct process *next;
   struct process *prev;
 } process_t;
 
 void process_init(void);
+void process_init_ap(uint32_t cpu_id);
 process_t *process_create(const char *name, void (*entry_point)(void));
 void process_destroy(process_t *process);
 void process_exit(int exit_code);
@@ -93,5 +89,6 @@ void scheduler_init(void);
 void scheduler_tick(void);
 void schedule(void);
 void context_switch(context_t *old, context_t *new);
+int scheduler_is_enabled(void);
 
 #endif

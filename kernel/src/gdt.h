@@ -47,6 +47,7 @@ struct tss {
 } __attribute__((packed));
 
 void gdt_init(void);
-void tss_set_kernel_stack(uint64_t stack);
+void gdt_init_ap(uint32_t cpu_id);
+void tss_set_kernel_stack(uint32_t cpu_id, uint64_t stack);
 
 #endif

@@ -3,20 +3,23 @@
 #include "heap.h"
 #include "libc.h"
 #include "pit.h"
+#include "smp.h"
 #include "sync.h"
 #include "types.h"
 #include "vfs.h"
+#include "vmm.h"
 #include <stddef.h>
 #include <stdint.h>
 
+#define IDLE_PID_BASE 0xFFFF0000U
+
 static process_t *process_list_head = NULL;
-static process_t *current_process = NULL;
-static process_t *idle_process = NULL;
+static process_t *current_processes[SMP_MAX_CPUS] = {0};
+static process_t *idle_processes[SMP_MAX_CPUS] = {0};
 static uint32_t next_pid = 1;
 static uint32_t process_count = 0;
 static int scheduler_enabled = 0;
 
-// Synchronization for process management
 static spinlock_t process_list_lock = SPINLOCK_INIT("process_list");
 static spinlock_t pid_counter_lock = SPINLOCK_INIT("pid_counter");
 static spinlock_t scheduler_lock = SPINLOCK_INIT("scheduler");
@@ -29,47 +32,132 @@ static void idle_task(void) {
   }
 }
 
+static inline uint32_t current_cpu_index(void) { return smp_get_cpu_id(); }
+
+static inline bool is_idle_process(process_t *process) {
+  for (uint32_t i = 0; i < SMP_MAX_CPUS; i++) {
+    if (idle_processes[i] == process) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static inline bool is_idle_for_other_cpu(process_t *process, uint32_t cpu_id) {
+  for (uint32_t i = 0; i < SMP_MAX_CPUS; i++) {
+    if (idle_processes[i] == process) {
+      return i != cpu_id;
+    }
+  }
+  return false;
+}
+
+static process_t *get_current_process_local(void) {
+  return current_processes[current_cpu_index()];
+}
+
+static void set_current_process_local(process_t *process) {
+  uint32_t cpu = current_cpu_index();
+  current_processes[cpu] = process;
+  smp_set_current_process(process);
+}
+
+static process_t *create_idle_process(uint32_t cpu_id) {
+  process_t *idle = kmalloc(sizeof(process_t));
+  if (!idle) {
+    kprint("kmalloc idle failed\n");
+    return NULL;
+  }
+
+  for (size_t i = 0; i < sizeof(process_t); i++) {
+    ((uint8_t *)idle)[i] = 0;
+  }
+  idle->pid = (cpu_id == 0) ? 0 : (IDLE_PID_BASE + cpu_id);
+  idle->ppid = 0;
+  strcpy(idle->name, "idle");
+  strcpy(idle->cwd, "/");
+  idle->state = PROCESS_STATE_READY;
+  idle->time_slice = DEFAULT_TIME_SLICE;
+  idle->ticks_remaining = DEFAULT_TIME_SLICE;
+  idle->stack_size = KERNEL_STACK_SIZE;
+  idle->stack = kmalloc(KERNEL_STACK_SIZE);
+  if (!idle->stack) {
+    kprint("Idle stack allocation failed for CPU ");
+    kprint_hex(cpu_id);
+    kprint("\n");
+    kfree(idle);
+    return NULL;
+  }
+
+  memset(idle->stack, 0, KERNEL_STACK_SIZE);
+  uint64_t *stack_top =
+      (uint64_t *)((uint8_t *)idle->stack + KERNEL_STACK_SIZE);
+  memset(&idle->context, 0, sizeof(context_t));
+  idle->context.rsp = (uint64_t)stack_top;
+  idle->context.rip = (uint64_t)idle_task;
+  idle->context.rflags = 0x202;
+
+  for (int i = 0; i < 256; i++) {
+    idle->fd_table[i] = -1;
+  }
+  idle->fd_table[0] = 0;
+  idle->fd_table[1] = 1;
+  idle->fd_table[2] = 2;
+
+  spin_lock(&process_list_lock);
+  if (!process_list_head) {
+    process_list_head = idle;
+  } else {
+    process_t *last = process_list_head;
+    while (last->next) {
+      last = last->next;
+    }
+    last->next = idle;
+    idle->prev = last;
+  }
+  process_count++;
+  spin_unlock(&process_list_lock);
+
+  idle_processes[cpu_id] = idle;
+  smp_set_idle_process(cpu_id, idle);
+  return idle;
+}
+
 void process_init(void) {
   kprint("Initializing process management...\n");
 
-  idle_process = kmalloc(sizeof(process_t));
-  if (!idle_process) {
+  memset(current_processes, 0, sizeof(current_processes));
+  memset(idle_processes, 0, sizeof(idle_processes));
+
+  process_t *idle0 = create_idle_process(0);
+  if (!idle0) {
     kprint("Failed to allocate idle process\n");
     return;
   }
 
-  memset(idle_process, 0, sizeof(process_t));
-  idle_process->pid = 0;
-  idle_process->ppid = 0;
-  strcpy(idle_process->name, "idle");
-  strcpy(idle_process->cwd, "/"); // Set root as default cwd
-  idle_process->state = PROCESS_STATE_READY;
-  idle_process->time_slice = DEFAULT_TIME_SLICE;
-  idle_process->ticks_remaining = DEFAULT_TIME_SLICE;
+  idle0->state = PROCESS_STATE_RUNNING;
+  idle0->ticks_remaining = idle0->time_slice;
+  set_current_process_local(idle0);
 
-  idle_process->stack_size = KERNEL_STACK_SIZE;
-  idle_process->stack = kmalloc(KERNEL_STACK_SIZE);
-  if (!idle_process->stack) {
-    kprint("Failed to allocate idle process stack\n");
-    kfree(idle_process);
-    idle_process = NULL;
+  smp_start_lapic_timer();
+
+  kprint("Process init complete\n");
+  kprint("Process management initialized\n");
+}
+
+void process_init_ap(uint32_t cpu_id) {
+  process_t *idle = create_idle_process(cpu_id);
+  if (!idle) {
+    kprint("Failed to allocate idle process for CPU ");
+    kprint_hex(cpu_id);
+    kprint("\n");
     return;
   }
 
-  uint64_t *stack_top =
-      (uint64_t *)((uint8_t *)idle_process->stack + KERNEL_STACK_SIZE);
-
-  // Initialize context for first switch
-  memset(&idle_process->context, 0, sizeof(context_t));
-  idle_process->context.rsp = (uint64_t)stack_top;
-  idle_process->context.rip = (uint64_t)idle_task;
-  idle_process->context.rflags = 0x202; // Interrupts enabled
-
-  process_list_head = idle_process;
-  current_process = idle_process;
-  process_count = 1;
-
-  kprint("Process management initialized\n");
+  idle->state = PROCESS_STATE_RUNNING;
+  idle->ticks_remaining = idle->time_slice;
+  current_processes[cpu_id] = idle;
+  smp_set_current_process(idle);
 }
 
 process_t *process_create(const char *name, void (*entry_point)(void)) {
@@ -80,17 +168,16 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
 
   memset(process, 0, sizeof(process_t));
 
-  // Safely allocate PID with lock
   spin_lock(&pid_counter_lock);
   process->pid = next_pid++;
   spin_unlock(&pid_counter_lock);
 
-  process->ppid = current_process ? current_process->pid : 0;
+  process_t *parent = get_current_process_local();
+  process->ppid = parent ? parent->pid : 0;
   strncpy(process->name, name, 63);
   process->name[63] = '\0';
-  // Inherit parent's working directory
-  if (current_process) {
-    strcpy(process->cwd, current_process->cwd);
+  if (parent) {
+    strcpy(process->cwd, parent->cwd);
   } else {
     strcpy(process->cwd, "/");
   }
@@ -98,21 +185,17 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
   process->time_slice = DEFAULT_TIME_SLICE;
   process->ticks_remaining = DEFAULT_TIME_SLICE;
 
-  // Initialize file descriptor table
   for (int i = 0; i < 256; i++) {
     process->fd_table[i] = -1;
   }
-  // Set up standard file descriptors
-  process->fd_table[0] = 0; // stdin
-  process->fd_table[1] = 1; // stdout
-  process->fd_table[2] = 2; // stderr
+  process->fd_table[0] = 0;
+  process->fd_table[1] = 1;
+  process->fd_table[2] = 2;
 
-  // Initialize memory management
-  process->brk = (void *)0x10000000; // Start heap at 256MB
+  process->brk = (void *)0x10000000;
   process->brk_start = process->brk;
 
-  // Initialize process relationships
-  process->parent = current_process;
+  process->parent = parent;
   process->children = NULL;
   process->sibling = NULL;
   process->exit_status = 0;
@@ -125,21 +208,13 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
   }
 
   memset(process->stack, 0, KERNEL_STACK_SIZE);
-
   uint64_t *stack_top =
       (uint64_t *)((uint8_t *)process->stack + KERNEL_STACK_SIZE);
-
-  // Set up initial stack
-  // When context_switch loads this context, it will push RIP and then ret to it
-  // So we just need the stack pointer to be at the right place
-
-  // Initialize context for first switch
   memset(&process->context, 0, sizeof(context_t));
-  process->context.rsp = (uint64_t)stack_top;   // Stack pointer at top
-  process->context.rip = (uint64_t)entry_point; // Where to jump
-  process->context.rflags = 0x202;              // Interrupts enabled
+  process->context.rsp = (uint64_t)stack_top;
+  process->context.rip = (uint64_t)entry_point;
+  process->context.rflags = 0x202;
 
-  // Add to process list with lock
   spin_lock(&process_list_lock);
   if (process_list_head) {
     process_t *last = process_list_head;
@@ -154,13 +229,17 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
   process_count++;
   spin_unlock(&process_list_lock);
 
+  if (parent) {
+    process->sibling = parent->children;
+    parent->children = process;
+  }
+
   kprint("Created process '");
   kprint(name);
   kprint("' with PID ");
   kprint_hex(process->pid);
   kprint("\n");
 
-  // Force a schedule to run the new process
   if (scheduler_enabled) {
     schedule();
   }
@@ -169,7 +248,7 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
 }
 
 void process_destroy(process_t *process) {
-  if (!process || process == idle_process) {
+  if (!process || is_idle_process(process)) {
     return;
   }
 
@@ -177,7 +256,6 @@ void process_destroy(process_t *process) {
     process->state = PROCESS_STATE_TERMINATED;
   }
 
-  // Lock process list while removing process
   spin_lock(&process_list_lock);
   if (process->prev) {
     process->prev->next = process->next;
@@ -191,7 +269,6 @@ void process_destroy(process_t *process) {
   process_count--;
   spin_unlock(&process_list_lock);
 
-  // Free resources outside of lock
   if (process->stack) {
     kfree(process->stack);
   }
@@ -200,27 +277,32 @@ void process_destroy(process_t *process) {
 }
 
 void process_exit(int exit_code) {
-  if (current_process && current_process != idle_process) {
-    current_process->exit_status = exit_code;
-    current_process->state = PROCESS_STATE_ZOMBIE;
+  process_t *proc = get_current_process_local();
+  if (proc && !is_idle_process(proc)) {
+    proc->exit_status = exit_code;
+    proc->state = PROCESS_STATE_ZOMBIE;
 
-    // Wake up parent if it's waiting
-    if (current_process->parent &&
-        current_process->parent->state == PROCESS_STATE_BLOCKED) {
-      current_process->parent->state = PROCESS_STATE_READY;
+    if (proc->parent && proc->parent->state == PROCESS_STATE_BLOCKED) {
+      proc->parent->state = PROCESS_STATE_READY;
     }
 
-    // Reparent children to init (process 1) or idle
-    process_t *child = current_process->children;
+    process_t *fallback_idle = idle_processes[0];
+    if (!fallback_idle) {
+      fallback_idle = proc;
+    }
+
+    process_t *child = proc->children;
     while (child) {
       process_t *next = child->sibling;
-      child->parent = idle_process; // Or init process when available
-      child->ppid = idle_process->pid;
-      child->sibling = idle_process->children;
-      idle_process->children = child;
+      child->parent = fallback_idle;
+      child->ppid = fallback_idle ? fallback_idle->pid : 0;
+      child->sibling = fallback_idle ? fallback_idle->children : NULL;
+      if (fallback_idle) {
+        fallback_idle->children = child;
+      }
       child = next;
     }
-    current_process->children = NULL;
+    proc->children = NULL;
 
     schedule();
   }
@@ -233,10 +315,10 @@ void process_yield(void) {
 }
 
 void process_sleep(uint32_t milliseconds) {
-  if (current_process && scheduler_enabled) {
-    current_process->state = PROCESS_STATE_BLOCKED;
-    current_process->ticks_remaining =
-        (milliseconds * PIT_DEFAULT_FREQUENCY) / 1000;
+  process_t *proc = get_current_process_local();
+  if (proc && scheduler_enabled) {
+    proc->state = PROCESS_STATE_BLOCKED;
+    proc->ticks_remaining = (milliseconds * PIT_DEFAULT_FREQUENCY) / 1000;
     schedule();
   } else {
     pit_sleep(milliseconds);
@@ -250,7 +332,7 @@ void process_wake(process_t *process) {
   }
 }
 
-process_t *process_get_current(void) { return current_process; }
+process_t *process_get_current(void) { return get_current_process_local(); }
 
 process_t *process_get_by_pid(uint32_t pid) {
   process_t *p = process_list_head;
@@ -264,8 +346,8 @@ process_t *process_get_by_pid(uint32_t pid) {
 }
 
 void process_list(void) {
-  kprint("PID  PPID  STATE     TICKS    NAME\n");
-  kprint("---  ----  --------  -------  ----------------\n");
+  kprint("PID  PPID  STATE     CPU  TICKS    NAME\n");
+  kprint("---  ----  --------  ---  -------  ----------------\n");
 
   process_t *p = process_list_head;
   while (p) {
@@ -293,6 +375,20 @@ void process_list(void) {
     }
 
     kprint("  ");
+    uint32_t cpu_id = SMP_MAX_CPUS;
+    for (uint32_t i = 0; i < SMP_MAX_CPUS; i++) {
+      if (idle_processes[i] == p || current_processes[i] == p) {
+        cpu_id = i;
+        break;
+      }
+    }
+    if (cpu_id == SMP_MAX_CPUS) {
+      kprint("-- ");
+    } else {
+      kprint_hex(cpu_id);
+      kprint(" ");
+    }
+
     kprint_hex(p->total_ticks);
     kprint("  ");
     kprint(p->name);
@@ -314,14 +410,17 @@ void scheduler_init(void) {
 }
 
 void scheduler_tick(void) {
-  if (!scheduler_enabled || !current_process) {
+  if (!scheduler_enabled) {
     return;
   }
 
-  // Update tick counts
-  current_process->total_ticks++;
+  process_t *current = get_current_process_local();
+  if (!current) {
+    return;
+  }
 
-  // Wake up sleeping processes
+  current->total_ticks++;
+
   process_t *p = process_list_head;
   while (p) {
     if (p->state == PROCESS_STATE_BLOCKED && p->ticks_remaining > 0) {
@@ -333,11 +432,9 @@ void scheduler_tick(void) {
     p = p->next;
   }
 
-  // Decrement time slice and schedule if needed
-  if (current_process->state == PROCESS_STATE_RUNNING) {
-    current_process->ticks_remaining--;
-    if (current_process->ticks_remaining == 0) {
-      // Time slice expired, schedule next process
+  if (current->state == PROCESS_STATE_RUNNING) {
+    current->ticks_remaining--;
+    if (current->ticks_remaining == 0) {
       schedule();
     }
   }
@@ -348,46 +445,41 @@ void schedule(void) {
     return;
   }
 
-  // Use IRQ-safe spinlock (disables interrupts automatically)
+  uint32_t cpu_id = current_cpu_index();
   irq_state_t flags = spin_lock_irqsave(&scheduler_lock);
-
-  // Also lock the process list while we're traversing it
   spin_lock(&process_list_lock);
 
-  process_t *old_process = current_process;
+  process_t *old_process = get_current_process_local();
   process_t *next_process = NULL;
 
-  // Mark current as ready if it was running
   if (old_process && old_process->state == PROCESS_STATE_RUNNING) {
     old_process->state = PROCESS_STATE_READY;
   }
 
-  // Find next ready process (round-robin)
-  process_t *p = old_process ? old_process->next : process_list_head;
-  if (!p) {
-    p = process_list_head;
+  process_t *start = old_process ? old_process->next : process_list_head;
+  if (!start) {
+    start = process_list_head;
   }
 
-  process_t *start = p;
-  do {
-    if (p->state == PROCESS_STATE_READY) {
+  process_t *p = start;
+  while (p) {
+    if (p->state == PROCESS_STATE_READY && !is_idle_for_other_cpu(p, cpu_id)) {
       next_process = p;
       break;
     }
-    p = p->next;
-    if (!p) {
-      p = process_list_head;
+    p = p->next ? p->next : process_list_head;
+    if (p == start) {
+      break;
     }
-  } while (p != start);
-
-  // If no ready process, use idle
-  if (!next_process) {
-    next_process = idle_process;
   }
 
-  // If same process, just continue
-  if (next_process == old_process) {
-    if (old_process->state == PROCESS_STATE_READY) {
+  if (!next_process) {
+    next_process =
+        idle_processes[cpu_id] ? idle_processes[cpu_id] : idle_processes[0];
+  }
+
+  if (old_process == next_process) {
+    if (old_process) {
       old_process->state = PROCESS_STATE_RUNNING;
       old_process->ticks_remaining = old_process->time_slice;
     }
@@ -396,52 +488,53 @@ void schedule(void) {
     return;
   }
 
-  // Switch to next process
-  next_process->state = PROCESS_STATE_RUNNING;
-  next_process->ticks_remaining = next_process->time_slice;
-  current_process = next_process;
+  if (next_process) {
+    next_process->state = PROCESS_STATE_RUNNING;
+    next_process->ticks_remaining = next_process->time_slice;
+    set_current_process_local(next_process);
+  }
 
   spin_unlock(&process_list_lock);
   spin_unlock_irqrestore(&scheduler_lock, flags);
 
-  // Perform context switch
   if (old_process && next_process) {
     context_switch(&old_process->context, &next_process->context);
+  } else if (next_process) {
+    context_switch(NULL, &next_process->context);
   }
 }
 
 const char *process_get_cwd(void) {
-  if (!current_process) {
+  process_t *proc = get_current_process_local();
+  if (!proc) {
     return "/";
   }
-  return current_process->cwd;
+  return proc->cwd;
 }
 
 int process_set_cwd(const char *path) {
-  if (!current_process) {
+  process_t *proc = get_current_process_local();
+  if (!proc) {
     return -1;
   }
 
-  // Verify the path exists and is a directory
   vfs_node_t *node = vfs_resolve_path(path);
   if (!node) {
-    return -1; // Path doesn't exist
+    return -1;
   }
 
   if (!(node->type & VFS_DIRECTORY)) {
-    return -1; // Not a directory
+    return -1;
   }
 
-  // Update the current working directory
-  strncpy(current_process->cwd, path, MAX_PATH_LENGTH - 1);
-  current_process->cwd[MAX_PATH_LENGTH - 1] = '\0';
+  strncpy(proc->cwd, path, MAX_PATH_LENGTH - 1);
+  proc->cwd[MAX_PATH_LENGTH - 1] = '\0';
 
-  // Ensure path ends with / for directories (except root)
-  size_t len = strlen(current_process->cwd);
-  if (len > 1 && current_process->cwd[len - 1] != '/') {
+  size_t len = strlen(proc->cwd);
+  if (len > 1 && proc->cwd[len - 1] != '/') {
     if (len < MAX_PATH_LENGTH - 1) {
-      current_process->cwd[len] = '/';
-      current_process->cwd[len + 1] = '\0';
+      proc->cwd[len] = '/';
+      proc->cwd[len + 1] = '\0';
     }
   }
 
@@ -449,22 +542,21 @@ int process_set_cwd(const char *path) {
 }
 
 process_t *process_fork(void) {
-  process_t *parent = current_process;
-  if (!parent)
+  process_t *parent = get_current_process_local();
+  if (!parent) {
     return NULL;
+  }
 
   process_t *child = kmalloc(sizeof(process_t));
-  if (!child)
+  if (!child) {
     return NULL;
+  }
 
-  // Copy parent process structure
   memcpy(child, parent, sizeof(process_t));
 
-  // Assign new PID
   child->pid = next_pid++;
   child->ppid = parent->pid;
 
-  // Allocate and copy stack
   child->stack = kmalloc(child->stack_size);
   if (!child->stack) {
     kfree(child);
@@ -472,22 +564,19 @@ process_t *process_fork(void) {
   }
   memcpy(child->stack, parent->stack, child->stack_size);
 
-  // Update stack pointer to point to child's stack
   uint64_t stack_offset = (uint64_t)child->stack - (uint64_t)parent->stack;
   child->context.rsp += stack_offset;
 
-  // Reset process state
   child->state = PROCESS_STATE_READY;
   child->total_ticks = 0;
   child->ticks_remaining = DEFAULT_TIME_SLICE;
 
-  // Set up process relationships
   child->parent = parent;
   child->children = NULL;
   child->sibling = parent->children;
   parent->children = child;
 
-  // Add to process list
+  spin_lock(&process_list_lock);
   if (process_list_head) {
     process_t *last = process_list_head;
     while (last->next) {
@@ -496,41 +585,40 @@ process_t *process_fork(void) {
     last->next = child;
     child->prev = last;
     child->next = NULL;
+  } else {
+    process_list_head = child;
   }
-
   process_count++;
+  spin_unlock(&process_list_lock);
 
   return child;
 }
 
 int process_waitpid(int pid, int *status, int options) {
-  (void)options; // Unused for now
+  (void)options;
 
-  process_t *parent = current_process;
-  if (!parent)
+  process_t *parent = get_current_process_local();
+  if (!parent) {
     return -1;
+  }
 
   while (1) {
-    // Check if specific child or any child
     process_t *child = parent->children;
     process_t *prev = NULL;
 
     while (child) {
       if ((pid == -1 || child->pid == (uint32_t)pid) &&
           child->state == PROCESS_STATE_ZOMBIE) {
-        // Found a zombie child
         if (status) {
           *status = child->exit_status;
         }
 
-        // Remove from children list
         if (prev) {
           prev->sibling = child->sibling;
         } else {
           parent->children = child->sibling;
         }
 
-        // Remove from process list
         if (child->prev) {
           child->prev->next = child->next;
         } else {
@@ -542,7 +630,6 @@ int process_waitpid(int pid, int *status, int options) {
 
         uint32_t child_pid = child->pid;
 
-        // Free child resources
         if (child->stack) {
           kfree(child->stack);
         }
@@ -555,16 +642,16 @@ int process_waitpid(int pid, int *status, int options) {
       child = child->sibling;
     }
 
-    // No zombie children found, block
     parent->state = PROCESS_STATE_BLOCKED;
     process_yield();
   }
 }
 
 void *process_sbrk(intptr_t increment) {
-  process_t *proc = current_process;
-  if (!proc)
+  process_t *proc = get_current_process_local();
+  if (!proc) {
     return (void *)-1;
+  }
 
   void *old_brk = proc->brk;
 
@@ -572,19 +659,18 @@ void *process_sbrk(intptr_t increment) {
     return old_brk;
   }
 
-  // Calculate new break
   void *new_brk = (char *)proc->brk + increment;
 
-  // Simple bounds check (you might want more sophisticated checks)
   if (new_brk < proc->brk_start) {
     return (void *)-1;
   }
 
-  // Check for overflow or too large allocation
-  if ((uintptr_t)new_brk > 0x20000000) { // Limit to 512MB for now
+  if ((uintptr_t)new_brk > 0x20000000) {
     return (void *)-1;
   }
 
   proc->brk = new_brk;
   return old_brk;
 }
+
+int scheduler_is_enabled(void) { return scheduler_enabled; }

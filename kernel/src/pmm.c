@@ -2,6 +2,7 @@
 #include "console.h"
 #include "libc.h"
 #include "limine_requests.h"
+#include "sync.h"
 #include <limine.h>
 #include <stdbool.h>
 
@@ -12,6 +13,10 @@ static size_t used_pages = 0;
 static size_t last_index = 0;
 static uint64_t hhdm_offset = 0;
 static uint64_t highest_page_addr = 0;
+static spinlock_t pmm_lock = SPINLOCK_INIT("pmm");
+
+extern char __kernel_start[];
+extern char __kernel_end[];
 
 static inline void bitmap_set(size_t index) {
   size_t byte_index = index / 8;
@@ -90,7 +95,10 @@ void pmm_init(void) {
     if (entry->type == LIMINE_MEMMAP_USABLE ||
         entry->type == LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE) {
       for (uint64_t j = 0; j < entry->length; j += PAGE_SIZE) {
-        bitmap_clear((entry->base + j) / PAGE_SIZE);
+        uint64_t page = (entry->base + j) / PAGE_SIZE;
+        if (page < total_pages && page != 0) {
+          bitmap_clear(page);
+        }
       }
     }
   }
@@ -99,6 +107,60 @@ void pmm_init(void) {
   for (size_t i = 0; i < total_pages; i++) {
     if (bitmap_test(i)) {
       used_pages++;
+    }
+  }
+
+  bitmap_set(0);
+  used_pages = total_pages - pmm_get_free_pages();
+
+  if (kernel_address_request.response != NULL &&
+      kernel_file_request.response != NULL &&
+      kernel_file_request.response->executable_file != NULL) {
+    struct limine_executable_address_response *addr_resp =
+        kernel_address_request.response;
+    struct limine_file *kernel_file =
+        kernel_file_request.response->executable_file;
+
+    uint64_t kernel_phys_start =
+        addr_resp->physical_base +
+        ((uint64_t)__kernel_start - addr_resp->virtual_base);
+    uint64_t kernel_size = (uint64_t)__kernel_end - (uint64_t)__kernel_start;
+    pmm_mark_used_range(kernel_phys_start, kernel_size);
+    kprint("PMM: reserved kernel phys 0x");
+    kprint_hex(kernel_phys_start);
+    kprint(" size 0x");
+    kprint_hex(kernel_size);
+    kprint("\n");
+
+    if (kernel_file->address != NULL && kernel_file->size > 0) {
+      uint64_t kernel_file_phys =
+          (uint64_t)kernel_file->address >= hhdm_offset
+              ? (uint64_t)kernel_file->address - hhdm_offset
+              : (uint64_t)kernel_file->address;
+      pmm_mark_used_range(kernel_file_phys, kernel_file->size);
+      kprint("PMM: reserved kernel file 0x");
+      kprint_hex(kernel_file_phys);
+      kprint(" size 0x");
+      kprint_hex(kernel_file->size);
+      kprint("\n");
+    }
+  }
+
+  if (module_request.response != NULL) {
+    for (uint64_t i = 0; i < module_request.response->module_count; i++) {
+      struct limine_file *mod = module_request.response->modules[i];
+      if (!mod || mod->address == NULL || mod->size == 0) {
+        continue;
+      }
+      uint64_t mod_phys = (uint64_t)mod->address >= hhdm_offset
+                              ? (uint64_t)mod->address - hhdm_offset
+                              : (uint64_t)mod->address;
+      pmm_mark_used_range(mod_phys, mod->size);
+      kprint("PMM: reserved module 0x");
+      kprint_hex(mod_phys);
+      kprint(" size 0x");
+      kprint_hex(mod->size);
+      kprint("\n");
     }
   }
 
@@ -122,6 +184,8 @@ void *pmm_alloc(size_t pages) {
     return NULL;
   }
 
+  spin_lock(&pmm_lock);
+
   size_t consecutive = 0;
   size_t start_page = 0;
 
@@ -137,13 +201,25 @@ void *pmm_alloc(size_t pages) {
         }
         used_pages += pages;
         last_index = start_page + pages;
-        return (void *)(start_page * PAGE_SIZE);
+        void *addr = (void *)(start_page * PAGE_SIZE);
+        spin_unlock(&pmm_lock);
+        return addr;
       }
     } else {
       consecutive = 0;
     }
   }
 
+  kprint("PMM: alloc failed (pages: 0x");
+  kprint_hex(pages);
+  kprint(") free: 0x");
+  kprint_hex(total_pages - used_pages);
+  kprint(" used: 0x");
+  kprint_hex(used_pages);
+  kprint(" total: 0x");
+  kprint_hex(total_pages);
+  kprint("\n");
+  spin_unlock(&pmm_lock);
   return NULL;
 }
 
@@ -160,6 +236,8 @@ void pmm_free(void *ptr, size_t pages) {
     return;
   }
 
+  spin_lock(&pmm_lock);
+
   size_t page = (size_t)ptr / PAGE_SIZE;
   for (size_t i = 0; i < pages; i++) {
     if (page + i < total_pages && bitmap_test(page + i)) {
@@ -167,6 +245,8 @@ void pmm_free(void *ptr, size_t pages) {
       used_pages--;
     }
   }
+
+  spin_unlock(&pmm_lock);
 }
 
 size_t pmm_get_free_pages(void) { return total_pages - used_pages; }
@@ -174,3 +254,47 @@ size_t pmm_get_free_pages(void) { return total_pages - used_pages; }
 size_t pmm_get_total_pages(void) { return total_pages; }
 
 size_t pmm_get_used_pages(void) { return used_pages; }
+
+static void bitmap_set_range(size_t start_page, size_t page_count) {
+  for (size_t i = 0; i < page_count; i++) {
+    bitmap_set(start_page + i);
+  }
+}
+
+void pmm_mark_used(uint64_t phys_addr) {
+  size_t page = phys_addr / PAGE_SIZE;
+  if (page >= total_pages) {
+    return;
+  }
+
+  spin_lock(&pmm_lock);
+  if (!bitmap_test(page)) {
+    bitmap_set(page);
+    used_pages++;
+  }
+  spin_unlock(&pmm_lock);
+}
+
+void pmm_mark_used_range(uint64_t phys_addr, size_t length) {
+  if (length == 0) {
+    return;
+  }
+
+  uint64_t end = phys_addr + length - 1;
+  size_t start_page = phys_addr / PAGE_SIZE;
+  size_t end_page = end / PAGE_SIZE;
+  size_t count = end_page - start_page + 1;
+
+  spin_lock(&pmm_lock);
+  for (size_t i = 0; i < count; i++) {
+    size_t page = start_page + i;
+    if (page >= total_pages) {
+      break;
+    }
+    if (!bitmap_test(page)) {
+      bitmap_set(page);
+      used_pages++;
+    }
+  }
+  spin_unlock(&pmm_lock);
+}

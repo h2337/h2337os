@@ -3,9 +3,30 @@
 #include "flanterm/flanterm_backends/fb.h"
 #include "libc.h"
 #include "serial.h"
+#include "smp.h"
+#include "sync.h"
+#include <stddef.h>
 
 struct flanterm_context *ft_ctx;
 static bool serial_enabled = false;
+static spinlock_t console_lock = SPINLOCK_INIT("console");
+
+static void console_flush(cpu_local_t *cpu) {
+  if (!cpu || cpu->console_buffer_len == 0) {
+    return;
+  }
+
+  cpu->console_buffer[cpu->console_buffer_len] = '\0';
+
+  irq_state_t flags = spin_lock_irqsave(&console_lock);
+  flanterm_write(ft_ctx, cpu->console_buffer, cpu->console_buffer_len);
+  if (serial_enabled) {
+    serial_writestring(COM1, cpu->console_buffer);
+  }
+  spin_unlock_irqrestore(&console_lock, flags);
+
+  cpu->console_buffer_len = 0;
+}
 
 void console_init(struct limine_framebuffer *fb) {
   ft_ctx = flanterm_fb_init(
@@ -20,18 +41,61 @@ void console_init(struct limine_framebuffer *fb) {
 }
 
 void kprint(const char *str) {
-  flanterm_write(ft_ctx, str, strlen(str));
-  if (serial_enabled) {
-    serial_writestring(COM1, str);
+  if (!str) {
+    return;
+  }
+
+  cpu_local_t *cpu = smp_get_cpu_local();
+
+  if (!cpu) {
+    size_t len = strlen(str);
+    if (len == 0) {
+      return;
+    }
+    irq_state_t flags = spin_lock_irqsave(&console_lock);
+    flanterm_write(ft_ctx, str, len);
+    if (serial_enabled) {
+      serial_writestring(COM1, str);
+    }
+    spin_unlock_irqrestore(&console_lock, flags);
+    return;
+  }
+
+  bool flush_after = false;
+
+  while (*str) {
+    char c = *str++;
+
+    if (cpu->console_buffer_len >= CONSOLE_BUFFER_SIZE - 1) {
+      console_flush(cpu);
+    }
+
+    cpu->console_buffer[cpu->console_buffer_len++] = c;
+
+    if (c == '\n') {
+      console_flush(cpu);
+    } else if (c == '\r' || c == '\b') {
+      flush_after = true;
+    }
+  }
+
+  if (flush_after) {
+    console_flush(cpu);
   }
 }
 
 void kputchar(char c) {
   char str[2] = {c, '\0'};
-  flanterm_write(ft_ctx, str, 1);
-  if (serial_enabled) {
-    serial_write(COM1, c);
+  kprint(str);
+  kflush();
+}
+
+void kflush(void) {
+  cpu_local_t *cpu = smp_get_cpu_local();
+  if (!cpu) {
+    return;
   }
+  console_flush(cpu);
 }
 
 char kgetchar(void) {
