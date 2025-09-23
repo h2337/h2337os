@@ -2,6 +2,7 @@
 #include "console.h"
 #include "idt.h"
 #include "pic.h"
+#include "tty.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -30,11 +31,6 @@ static const char scancode_to_ascii_shift[] = {
     0,    0,    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0};
 
 static keyboard_state_t kb_state = {false, false, false, false, false, false};
-static char keyboard_buffer[KEYBOARD_BUFFER_SIZE];
-static uint16_t buffer_start = 0;
-static uint16_t buffer_end = 0;
-static uint16_t buffer_count = 0;
-
 static inline uint8_t inb(uint16_t port) {
   uint8_t ret;
   asm volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
@@ -55,16 +51,6 @@ static void keyboard_wait_output(void) {
   while ((inb(KEYBOARD_STATUS_PORT) & 1) == 0) {
     asm volatile("pause");
   }
-}
-
-static void keyboard_add_to_buffer(char c) {
-  if (buffer_count >= KEYBOARD_BUFFER_SIZE) {
-    return;
-  }
-
-  keyboard_buffer[buffer_end] = c;
-  buffer_end = (buffer_end + 1) % KEYBOARD_BUFFER_SIZE;
-  buffer_count++;
 }
 
 void keyboard_handler(void) {
@@ -127,7 +113,7 @@ void keyboard_handler(void) {
             c = c - 'A' + 1;
           }
 
-          keyboard_add_to_buffer(c);
+          tty_handle_input(c);
         }
       }
       break;
@@ -137,24 +123,11 @@ void keyboard_handler(void) {
   pic_send_eoi(1);
 }
 
-char keyboard_getchar(void) {
-  while (buffer_count == 0) {
-    asm volatile("hlt");
-  }
+char keyboard_getchar(void) { return tty_getchar(); }
 
-  char c = keyboard_buffer[buffer_start];
-  buffer_start = (buffer_start + 1) % KEYBOARD_BUFFER_SIZE;
-  buffer_count--;
-  return c;
-}
+bool keyboard_has_input(void) { return tty_has_input(); }
 
-bool keyboard_has_input(void) { return buffer_count > 0; }
-
-void keyboard_flush_buffer(void) {
-  buffer_start = 0;
-  buffer_end = 0;
-  buffer_count = 0;
-}
+void keyboard_flush_buffer(void) { tty_flush(); }
 
 void keyboard_init(void) {
   keyboard_wait_input();

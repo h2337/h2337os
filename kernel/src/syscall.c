@@ -4,7 +4,9 @@
 #include "heap.h"
 #include "idt.h"
 #include "libc.h"
+#include "pipe.h"
 #include "process.h"
+#include "tty.h"
 #include "types.h"
 #include "vfs.h"
 #include "vmm.h"
@@ -22,31 +24,35 @@ static uint64_t sys_exit(int exit_code) {
 }
 
 static uint64_t sys_write(int fd, const char *buf, size_t count) {
-  if (fd == 1 || fd == 2) {
-    for (size_t i = 0; i < count; i++) {
-      kputchar(buf[i]);
-    }
-    return count;
+  process_t *proc = process_get_current();
+  if (!proc || fd < 0 || fd >= 256 || !buf)
+    return -1;
+
+  int vfs_fd = proc->fd_table[fd];
+  if (vfs_fd >= 0) {
+    return vfs_write_fd(vfs_fd, (uint8_t *)buf, count);
   }
+
+  if (fd == 1 || fd == 2) {
+    return tty_write(buf, count);
+  }
+
   return -1;
 }
 
 static uint64_t sys_read(int fd, char *buf, size_t count) {
   process_t *proc = process_get_current();
-  if (!proc || fd < 0 || fd >= 256)
+  if (!proc || fd < 0 || fd >= 256 || !buf)
     return -1;
 
   int vfs_fd = proc->fd_table[fd];
-  if (vfs_fd < 0)
-    return -1;
+  if (vfs_fd >= 0)
+    return vfs_read_fd(vfs_fd, (uint8_t *)buf, count);
 
-  // For stdin, we'd need keyboard input
-  if (fd == 0) {
-    // TODO: Implement keyboard input
-    return 0;
-  }
+  if (fd == 0)
+    return tty_read(buf, count);
 
-  return vfs_read_fd(vfs_fd, (uint8_t *)buf, count);
+  return -1;
 }
 
 static uint64_t sys_open(const char *path, int flags, int mode) {
@@ -149,13 +155,21 @@ static uint64_t sys_brk(void *addr) {
     return (uint64_t)proc->brk;
   }
 
-  // Set new break
-  if ((uintptr_t)addr < (uintptr_t)proc->brk_start ||
-      (uintptr_t)addr > 0x20000000) {
+  uintptr_t current_brk = (uintptr_t)proc->brk;
+  uintptr_t target = (uintptr_t)addr;
+
+  intptr_t delta;
+  if (target >= current_brk) {
+    delta = (intptr_t)(target - current_brk);
+  } else {
+    delta = -(intptr_t)(current_brk - target);
+  }
+
+  void *result = process_sbrk(delta);
+  if (result == (void *)-1) {
     return -1;
   }
 
-  proc->brk = addr;
   return (uint64_t)addr;
 }
 
@@ -302,7 +316,7 @@ static uint64_t sys_dup(int oldfd) {
   for (int i = 0; i < 256; i++) {
     if (proc->fd_table[i] == -1) {
       proc->fd_table[i] = vfs_fd;
-      // TODO: Increment reference count in VFS
+      vfs_retain_fd(vfs_fd);
       return i;
     }
   }
@@ -328,13 +342,52 @@ static uint64_t sys_dup2(int oldfd, int newfd) {
   }
 
   proc->fd_table[newfd] = vfs_fd;
-  // TODO: Increment reference count in VFS
+  vfs_retain_fd(vfs_fd);
   return newfd;
 }
 
 static uint64_t sys_pipe(int pipefd[2]) {
-  (void)pipefd;
-  return -1;
+  if (!pipefd)
+    return -1;
+
+  process_t *proc = process_get_current();
+  if (!proc)
+    return -1;
+
+  int read_handle = -1;
+  int write_handle = -1;
+
+  if (pipe_create(&read_handle, &write_handle) < 0) {
+    return -1;
+  }
+
+  int read_slot = -1;
+  int write_slot = -1;
+
+  for (int i = 0; i < 256; i++) {
+    if (proc->fd_table[i] == -1) {
+      if (read_slot == -1) {
+        read_slot = i;
+      } else {
+        write_slot = i;
+        break;
+      }
+    }
+  }
+
+  if (write_slot == -1) {
+    vfs_close_fd(read_handle);
+    vfs_close_fd(write_handle);
+    return -1;
+  }
+
+  proc->fd_table[read_slot] = read_handle;
+  proc->fd_table[write_slot] = write_handle;
+
+  pipefd[0] = read_slot;
+  pipefd[1] = write_slot;
+
+  return 0;
 }
 
 static uint64_t sys_mkdir(const char *path, mode_t mode) {

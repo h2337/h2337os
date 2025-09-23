@@ -63,7 +63,7 @@ typedef struct vfs_node {
   vfs_create_t create;
   vfs_unlink_t unlink;
 
-  struct vfs_node *ptr;
+  void *ptr;
   struct vfs_filesystem *fs;
 } vfs_node_t;
 
@@ -87,6 +87,7 @@ typedef struct vfs_file {
   uint32_t flags;
   int fd;
   int in_use;
+  int refcount;
 } vfs_file_t;
 
 typedef struct {
@@ -97,6 +98,7 @@ typedef struct {
 
 void vfs_init(void);
 int vfs_register_filesystem(vfs_filesystem_t *fs);
+int vfs_register_special(const char *path, vfs_node_t *node);
 int vfs_mount(const char *device, const char *mountpoint, const char *fstype);
 int vfs_unmount(const char *mountpoint);
 
@@ -112,7 +114,9 @@ int vfs_create(vfs_node_t *parent, const char *name, uint32_t type);
 int vfs_unlink(vfs_node_t *parent, const char *name);
 
 int vfs_open_fd(const char *path, uint32_t flags);
+int vfs_create_fd(vfs_node_t *node, uint32_t flags);
 void vfs_close_fd(int fd);
+void vfs_retain_fd(int fd);
 uint32_t vfs_read_fd(int fd, uint8_t *buffer, uint32_t size);
 uint32_t vfs_write_fd(int fd, uint8_t *buffer, uint32_t size);
 int vfs_seek_fd(int fd, int32_t offset, int whence);

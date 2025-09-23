@@ -1,8 +1,11 @@
 #ifndef PROCESS_H
 #define PROCESS_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#include "vmm.h"
 
 #define MAX_PROCESSES 256
 #define KERNEL_STACK_SIZE 8192
@@ -60,6 +63,9 @@ typedef struct process {
 
   int exit_status;
 
+  page_table_t *pagemap;
+  bool owns_pagemap;
+
   struct process *children;
   struct process *sibling;
   struct process *parent;
@@ -85,6 +91,7 @@ int process_set_cwd(const char *path);
 process_t *process_fork(void);
 int process_waitpid(int pid, int *status, int options);
 void *process_sbrk(intptr_t increment);
+void process_ensure_standard_streams(process_t *proc);
 void scheduler_init(void);
 void scheduler_tick(void);
 void schedule(void);

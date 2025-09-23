@@ -3,6 +3,7 @@
 #include "heap.h"
 #include "libc.h"
 #include "pit.h"
+#include "pmm.h"
 #include "smp.h"
 #include "sync.h"
 #include "types.h"
@@ -96,13 +97,12 @@ static process_t *create_idle_process(uint32_t cpu_id) {
   idle->context.rsp = (uint64_t)stack_top;
   idle->context.rip = (uint64_t)idle_task;
   idle->context.rflags = 0x202;
+  idle->pagemap = vmm_get_kernel_pagemap();
+  idle->owns_pagemap = false;
 
   for (int i = 0; i < 256; i++) {
     idle->fd_table[i] = -1;
   }
-  idle->fd_table[0] = 0;
-  idle->fd_table[1] = 1;
-  idle->fd_table[2] = 2;
 
   spin_lock(&process_list_lock);
   if (!process_list_head) {
@@ -188,9 +188,6 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
   for (int i = 0; i < 256; i++) {
     process->fd_table[i] = -1;
   }
-  process->fd_table[0] = 0;
-  process->fd_table[1] = 1;
-  process->fd_table[2] = 2;
 
   process->brk = (void *)0x10000000;
   process->brk_start = process->brk;
@@ -199,6 +196,9 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
   process->children = NULL;
   process->sibling = NULL;
   process->exit_status = 0;
+
+  process->pagemap = vmm_get_kernel_pagemap();
+  process->owns_pagemap = false;
 
   process->stack_size = KERNEL_STACK_SIZE;
   process->stack = kmalloc(KERNEL_STACK_SIZE);
@@ -256,6 +256,16 @@ void process_destroy(process_t *process) {
     process->state = PROCESS_STATE_TERMINATED;
   }
 
+  for (int i = 0; i < 256; i++) {
+    int fd = process->fd_table[i];
+    if (fd >= 0) {
+      if (fd >= 3) {
+        vfs_close_fd(fd);
+      }
+      process->fd_table[i] = -1;
+    }
+  }
+
   spin_lock(&process_list_lock);
   if (process->prev) {
     process->prev->next = process->next;
@@ -271,6 +281,12 @@ void process_destroy(process_t *process) {
 
   if (process->stack) {
     kfree(process->stack);
+  }
+
+  if (process->owns_pagemap && process->pagemap) {
+    vmm_destroy_pagemap(process->pagemap);
+    process->pagemap = NULL;
+    process->owns_pagemap = false;
   }
 
   kfree(process);
@@ -494,7 +510,19 @@ void schedule(void) {
     set_current_process_local(next_process);
   }
 
+  page_table_t *old_map = (old_process && old_process->pagemap)
+                              ? old_process->pagemap
+                              : vmm_get_kernel_pagemap();
+  page_table_t *new_map = (next_process && next_process->pagemap)
+                              ? next_process->pagemap
+                              : vmm_get_kernel_pagemap();
+
   spin_unlock(&process_list_lock);
+
+  if (new_map && new_map != old_map) {
+    vmm_switch_pagemap(new_map);
+  }
+
   spin_unlock_irqrestore(&scheduler_lock, flags);
 
   if (old_process && next_process) {
@@ -554,25 +582,55 @@ process_t *process_fork(void) {
 
   memcpy(child, parent, sizeof(process_t));
 
-  child->pid = next_pid++;
-  child->ppid = parent->pid;
-
   child->stack = kmalloc(child->stack_size);
   if (!child->stack) {
     kfree(child);
     return NULL;
   }
+
   memcpy(child->stack, parent->stack, child->stack_size);
 
   uint64_t stack_offset = (uint64_t)child->stack - (uint64_t)parent->stack;
   child->context.rsp += stack_offset;
+  child->context.rbp += stack_offset;
 
+  spin_lock(&pid_counter_lock);
+  child->pid = next_pid++;
+  spin_unlock(&pid_counter_lock);
+
+  child->ppid = parent->pid;
   child->state = PROCESS_STATE_READY;
   child->total_ticks = 0;
   child->ticks_remaining = DEFAULT_TIME_SLICE;
+  child->children = NULL;
+  child->sibling = NULL;
+  child->next = NULL;
+  child->prev = NULL;
+
+  if (parent->owns_pagemap && parent->pagemap) {
+    page_table_t *clone_map = vmm_clone_user_pagemap(parent->pagemap);
+    if (!clone_map) {
+      kfree(child->stack);
+      kfree(child);
+      return NULL;
+    }
+    child->pagemap = clone_map;
+    child->owns_pagemap = true;
+  } else {
+    child->pagemap = parent->pagemap;
+    child->owns_pagemap = false;
+  }
+
+  for (int i = 0; i < 256; i++) {
+    int fd = child->fd_table[i];
+    if (fd >= 0) {
+      vfs_retain_fd(fd);
+    }
+  }
+
+  child->context.rax = 0;
 
   child->parent = parent;
-  child->children = NULL;
   child->sibling = parent->children;
   parent->children = child;
 
@@ -584,7 +642,6 @@ process_t *process_fork(void) {
     }
     last->next = child;
     child->prev = last;
-    child->next = NULL;
   } else {
     process_list_head = child;
   }
@@ -619,22 +676,9 @@ int process_waitpid(int pid, int *status, int options) {
           parent->children = child->sibling;
         }
 
-        if (child->prev) {
-          child->prev->next = child->next;
-        } else {
-          process_list_head = child->next;
-        }
-        if (child->next) {
-          child->next->prev = child->prev;
-        }
-
         uint32_t child_pid = child->pid;
 
-        if (child->stack) {
-          kfree(child->stack);
-        }
-        kfree(child);
-        process_count--;
+        process_destroy(child);
 
         return child_pid;
       }
@@ -647,30 +691,106 @@ int process_waitpid(int pid, int *status, int options) {
   }
 }
 
+void process_ensure_standard_streams(process_t *proc) {
+  if (!proc) {
+    return;
+  }
+
+  const uint32_t std_flags[3] = {VFS_READ, VFS_WRITE, VFS_WRITE};
+
+  for (int fd = 0; fd < 3; fd++) {
+    if (proc->fd_table[fd] < 0) {
+      int vfs_fd = vfs_open_fd("/dev/tty", std_flags[fd]);
+      if (vfs_fd >= 0) {
+        proc->fd_table[fd] = vfs_fd;
+      }
+    }
+  }
+}
+
 void *process_sbrk(intptr_t increment) {
   process_t *proc = get_current_process_local();
-  if (!proc) {
+  if (!proc || !proc->pagemap) {
     return (void *)-1;
   }
-
-  void *old_brk = proc->brk;
 
   if (increment == 0) {
-    return old_brk;
+    return proc->brk;
   }
 
-  void *new_brk = (char *)proc->brk + increment;
+  const uintptr_t user_heap_limit = 0x20000000ULL;
 
-  if (new_brk < proc->brk_start) {
+  uintptr_t current_brk = (uintptr_t)proc->brk;
+  uintptr_t new_brk;
+
+  if (increment > 0) {
+    uintptr_t inc = (uintptr_t)increment;
+    if (UINTPTR_MAX - current_brk < inc) {
+      return (void *)-1;
+    }
+    new_brk = current_brk + inc;
+  } else {
+    uintptr_t dec = (uintptr_t)(-increment);
+    if (current_brk < dec) {
+      return (void *)-1;
+    }
+    new_brk = current_brk - dec;
+  }
+
+  if (new_brk < (uintptr_t)proc->brk_start || new_brk > user_heap_limit) {
     return (void *)-1;
   }
 
-  if ((uintptr_t)new_brk > 0x20000000) {
-    return (void *)-1;
+  uintptr_t old_page_aligned =
+      (current_brk + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
+  uintptr_t new_page_aligned =
+      (new_brk + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
+
+  if (increment > 0) {
+    for (uintptr_t addr = old_page_aligned; addr < new_page_aligned;
+         addr += PAGE_SIZE) {
+      void *phys_ptr = pmm_alloc_zero(1);
+      if (!phys_ptr) {
+        // Roll back previously mapped pages
+        for (uintptr_t rollback = old_page_aligned; rollback < addr;
+             rollback += PAGE_SIZE) {
+          uint64_t phys = vmm_get_phys(proc->pagemap, rollback);
+          if (phys) {
+            vmm_unmap_page(proc->pagemap, rollback);
+            pmm_free((void *)phys, 1);
+          }
+        }
+        return (void *)-1;
+      }
+
+      if (!vmm_map_page(proc->pagemap, addr, (uint64_t)phys_ptr,
+                        VMM_PRESENT | VMM_WRITABLE | VMM_USER)) {
+        pmm_free(phys_ptr, 1);
+        for (uintptr_t rollback = old_page_aligned; rollback < addr;
+             rollback += PAGE_SIZE) {
+          uint64_t phys = vmm_get_phys(proc->pagemap, rollback);
+          if (phys) {
+            vmm_unmap_page(proc->pagemap, rollback);
+            pmm_free((void *)phys, 1);
+          }
+        }
+        return (void *)-1;
+      }
+    }
+  } else {
+    for (uintptr_t addr = new_page_aligned; addr < old_page_aligned;
+         addr += PAGE_SIZE) {
+      uint64_t phys = vmm_get_phys(proc->pagemap, addr);
+      if (phys) {
+        vmm_unmap_page(proc->pagemap, addr);
+        pmm_free((void *)phys, 1);
+      }
+    }
   }
 
-  proc->brk = new_brk;
-  return old_brk;
+  void *old_brk_ptr = (void *)current_brk;
+  proc->brk = (void *)new_brk;
+  return old_brk_ptr;
 }
 
 int scheduler_is_enabled(void) { return scheduler_enabled; }

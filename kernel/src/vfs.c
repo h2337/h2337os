@@ -12,9 +12,18 @@ static vfs_mount_t *mount_points = NULL;
 static vfs_file_t open_files[VFS_MAX_OPEN_FILES];
 static int next_fd = 3;
 
-// Synchronization for VFS operations
-static spinlock_t vfs_lock = SPINLOCK_INIT("vfs");
+typedef struct vfs_special {
+  char path[VFS_MAX_PATH];
+  vfs_node_t *node;
+  struct vfs_special *next;
+} vfs_special_t;
+
+static vfs_special_t *special_nodes = NULL;
+
+// Synchronization for file descriptor table
 static spinlock_t fd_lock = SPINLOCK_INIT("fd_table");
+
+static char *vfs_normalize_path(const char *path, char *normalized);
 
 void vfs_init(void) {
   kprint("Initializing Virtual File System...\n");
@@ -48,6 +57,43 @@ int vfs_register_filesystem(vfs_filesystem_t *fs) {
   kprint("\n");
 
   return 0;
+}
+
+int vfs_register_special(const char *path, vfs_node_t *node) {
+  if (!path || !node) {
+    return -1;
+  }
+
+  vfs_special_t *entry = kmalloc(sizeof(vfs_special_t));
+  if (!entry) {
+    return -1;
+  }
+
+  vfs_normalize_path(path, entry->path);
+  entry->node = node;
+  entry->next = special_nodes;
+  special_nodes = entry;
+
+  return 0;
+}
+
+static vfs_node_t *vfs_lookup_special(const char *path) {
+  if (!path) {
+    return NULL;
+  }
+
+  char normalized[VFS_MAX_PATH];
+  vfs_normalize_path(path, normalized);
+
+  vfs_special_t *entry = special_nodes;
+  while (entry) {
+    if (strcmp(entry->path, normalized) == 0) {
+      return entry->node;
+    }
+    entry = entry->next;
+  }
+
+  return NULL;
 }
 
 vfs_filesystem_t *vfs_find_filesystem(const char *name) {
@@ -234,6 +280,14 @@ vfs_node_t *vfs_resolve_path(const char *path) {
 }
 
 vfs_node_t *vfs_open(const char *path, uint32_t flags) {
+  vfs_node_t *special = vfs_lookup_special(path);
+  if (special) {
+    if (special->open) {
+      special->open(special, flags);
+    }
+    return special;
+  }
+
   vfs_node_t *node = vfs_resolve_path(path);
 
   if (!node && (flags & VFS_CREATE)) {
@@ -347,6 +401,7 @@ int vfs_open_fd(const char *path, uint32_t flags) {
       open_files[i].flags = flags;
       open_files[i].fd = next_fd++;
       open_files[i].in_use = 1;
+      open_files[i].refcount = 1;
       result_fd = open_files[i].fd;
       break;
     }
@@ -360,18 +415,81 @@ int vfs_open_fd(const char *path, uint32_t flags) {
   return result_fd;
 }
 
+int vfs_create_fd(vfs_node_t *node, uint32_t flags) {
+  if (!node) {
+    return -1;
+  }
+
+  spin_lock(&fd_lock);
+
+  int result_fd = -1;
+  for (int i = 0; i < VFS_MAX_OPEN_FILES; i++) {
+    if (!open_files[i].in_use) {
+      open_files[i].node = node;
+      open_files[i].offset = 0;
+      open_files[i].flags = flags;
+      open_files[i].fd = next_fd++;
+      open_files[i].in_use = 1;
+      open_files[i].refcount = 1;
+      result_fd = open_files[i].fd;
+      break;
+    }
+  }
+
+  spin_unlock(&fd_lock);
+
+  if (result_fd == -1) {
+    return -1;
+  }
+
+  if (node->open) {
+    node->open(node, flags);
+  }
+
+  return result_fd;
+}
+
 void vfs_close_fd(int fd) {
   spin_lock(&fd_lock);
   for (int i = 0; i < VFS_MAX_OPEN_FILES; i++) {
     if (open_files[i].in_use && open_files[i].fd == fd) {
+      if (open_files[i].refcount > 1) {
+        open_files[i].refcount--;
+        spin_unlock(&fd_lock);
+        return;
+      }
+
       vfs_node_t *node = open_files[i].node;
       open_files[i].in_use = 0;
+      open_files[i].refcount = 0;
+      open_files[i].node = NULL;
+      open_files[i].offset = 0;
       spin_unlock(&fd_lock);
-      vfs_close(node); // Call vfs_close outside of lock to avoid deadlock
+      vfs_close(node);
       return;
     }
   }
   spin_unlock(&fd_lock);
+}
+
+void vfs_retain_fd(int fd) {
+  vfs_node_t *node = NULL;
+  uint32_t flags = 0;
+
+  spin_lock(&fd_lock);
+  for (int i = 0; i < VFS_MAX_OPEN_FILES; i++) {
+    if (open_files[i].in_use && open_files[i].fd == fd) {
+      open_files[i].refcount++;
+      node = open_files[i].node;
+      flags = open_files[i].flags;
+      break;
+    }
+  }
+  spin_unlock(&fd_lock);
+
+  if (node && node->open) {
+    node->open(node, flags);
+  }
 }
 
 uint32_t vfs_read_fd(int fd, uint8_t *buffer, uint32_t size) {

@@ -15,6 +15,7 @@
 #include "shell.h"
 #include "smp.h"
 #include "syscall.h"
+#include "tty.h"
 #include "usermode.h"
 #include "vfs.h"
 #include "vmm.h"
@@ -62,6 +63,7 @@ void kmain(void) {
 
   kprint("\n=== Initializing Keyboard ===\n");
   keyboard_init();
+  tty_init();
 
   kprint("\n=== Initializing Process Management ===\n");
   process_init();
@@ -72,6 +74,7 @@ void kmain(void) {
   vfs_init();
   fat32_init();
   ramdisk_init();
+  tty_register_device();
 
   asm volatile("sti");
   kprint("Interrupts enabled\n");

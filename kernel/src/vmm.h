@@ -28,6 +28,8 @@ typedef struct {
 void vmm_init(void);
 page_table_t *vmm_new_pagemap(void);
 void vmm_switch_pagemap(page_table_t *pagemap);
+void vmm_destroy_pagemap(page_table_t *pagemap);
+page_table_t *vmm_clone_user_pagemap(page_table_t *source);
 bool vmm_map_page(page_table_t *pagemap, uint64_t virt, uint64_t phys,
                   uint64_t flags);
 bool vmm_unmap_page(page_table_t *pagemap, uint64_t virt);

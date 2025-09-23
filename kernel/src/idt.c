@@ -3,7 +3,9 @@
 #include "keyboard.h"
 #include "pic.h"
 #include "pit.h"
+#include "process.h"
 #include "smp.h"
+#include <stdbool.h>
 #include <stddef.h>
 
 static struct idt_entry idt[256];
@@ -133,6 +135,8 @@ void exception_handler(struct interrupt_frame *frame) {
     return;
   }
 
+  bool user_mode = (frame->cs & 0x3) == 0x3;
+
   kprint("\n=== EXCEPTION OCCURRED ===\n");
   kprint("Exception: ");
 
@@ -150,6 +154,26 @@ void exception_handler(struct interrupt_frame *frame) {
     kprint("Error Code: 0x");
     kprint_hex(frame->err_code);
     kprint("\n");
+  }
+
+  if (frame->int_no == 14) {
+    uint64_t cr2;
+    asm volatile("mov %%cr2, %0" : "=r"(cr2));
+    kprint("Faulting address: 0x");
+    kprint_hex(cr2);
+    kprint("\n");
+  }
+
+  if (user_mode) {
+    process_t *proc = process_get_current();
+    kprint("Terminating process due to exception\n");
+    if (proc) {
+      kprint("Process PID: ");
+      kprint_hex(proc->pid);
+      kprint("\n");
+      process_exit(128 + (int)frame->int_no);
+      return;
+    }
   }
 
   kprint("\n=== REGISTER DUMP ===\n");

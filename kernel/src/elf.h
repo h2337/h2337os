@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "vmm.h"
+
 #define ELF_MAGIC 0x464C457F
 #define ELF_CLASS_64 2
 #define ELF_DATA_2LSB 1
@@ -53,7 +55,7 @@ typedef struct {
 } __attribute__((packed)) elf64_phdr_t;
 
 int elf_validate(const uint8_t *data);
-uint64_t elf_load(const uint8_t *data, uint64_t size);
+uint64_t elf_load(page_table_t *pagemap, const uint8_t *data, uint64_t size);
 int elf_exec(const char *path, char *const argv[], char *const envp[]);
 
 #endif

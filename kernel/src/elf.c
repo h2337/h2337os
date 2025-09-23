@@ -43,7 +43,8 @@ int elf_validate(const uint8_t *data) {
   return 1;
 }
 
-uint64_t elf_load(const uint8_t *data, uint64_t size) {
+uint64_t elf_load(page_table_t *target_pagemap, const uint8_t *data,
+                  uint64_t size) {
   if (!elf_validate(data)) {
     kprint("ELF: Invalid ELF header\n");
     return 0;
@@ -59,7 +60,7 @@ uint64_t elf_load(const uint8_t *data, uint64_t size) {
     entry_point += base;
   }
 
-  page_table_t *current_pagemap = vmm_get_kernel_pagemap();
+  page_table_t *kernel_pagemap = vmm_get_kernel_pagemap();
 
   for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
     if (phdr[i].p_type != PT_LOAD)
@@ -111,10 +112,11 @@ uint64_t elf_load(const uint8_t *data, uint64_t size) {
       // pages are executable by default unless NX bit is set.
       // We're not setting VMM_NO_EXECUTE for executable segments.
 
-      if (!vmm_map_page(current_pagemap, vaddr + j * PAGE_SIZE, phys, flags)) {
+      if (!vmm_map_page(target_pagemap, vaddr + j * PAGE_SIZE, phys, flags)) {
         kprint("ELF: Failed to map page at ");
         kprint_hex(vaddr + j * PAGE_SIZE);
         kprint("\n");
+        pmm_free((void *)phys, 1);
         return 0;
       }
     }
@@ -142,7 +144,7 @@ uint64_t elf_load(const uint8_t *data, uint64_t size) {
 
         // Get the physical address of this page
         uint64_t page_vaddr = vaddr + (virt_offset & ~0xFFF);
-        uint64_t phys_addr = vmm_get_phys(current_pagemap, page_vaddr);
+        uint64_t phys_addr = vmm_get_phys(target_pagemap, page_vaddr);
 
         if (!phys_addr) {
           kprint("ELF: Failed to get physical address for ");
@@ -153,7 +155,7 @@ uint64_t elf_load(const uint8_t *data, uint64_t size) {
 
         // Map the physical page temporarily at a high address
         uint64_t temp_vaddr = 0xFFFF900000000000 + phys_addr;
-        if (!vmm_map_page(current_pagemap, temp_vaddr, phys_addr,
+        if (!vmm_map_page(kernel_pagemap, temp_vaddr, phys_addr,
                           VMM_PRESENT | VMM_WRITABLE)) {
           kprint("ELF: Failed to create temporary mapping\n");
           return 0;
@@ -178,7 +180,7 @@ uint64_t elf_load(const uint8_t *data, uint64_t size) {
         */
 
         // Unmap the temporary mapping
-        vmm_unmap_page(current_pagemap, temp_vaddr);
+        vmm_unmap_page(kernel_pagemap, temp_vaddr);
 
         file_offset += copy_size;
         virt_offset += copy_size;
@@ -199,7 +201,7 @@ uint64_t elf_load(const uint8_t *data, uint64_t size) {
 
         // Get the physical address of this page
         uint64_t page_vaddr = vaddr + (zero_start & ~0xFFF);
-        uint64_t phys_addr = vmm_get_phys(current_pagemap, page_vaddr);
+        uint64_t phys_addr = vmm_get_phys(target_pagemap, page_vaddr);
 
         if (!phys_addr) {
           kprint("ELF: Failed to get physical address for BSS at ");
@@ -210,7 +212,7 @@ uint64_t elf_load(const uint8_t *data, uint64_t size) {
 
         // Map the physical page temporarily
         uint64_t temp_vaddr = 0xFFFF900000000000 + phys_addr;
-        if (!vmm_map_page(current_pagemap, temp_vaddr, phys_addr,
+        if (!vmm_map_page(kernel_pagemap, temp_vaddr, phys_addr,
                           VMM_PRESENT | VMM_WRITABLE)) {
           kprint("ELF: Failed to create temporary mapping for BSS\n");
           return 0;
@@ -220,7 +222,7 @@ uint64_t elf_load(const uint8_t *data, uint64_t size) {
         memset((void *)(temp_vaddr + page_offset), 0, clear_size);
 
         // Unmap the temporary mapping
-        vmm_unmap_page(current_pagemap, temp_vaddr);
+        vmm_unmap_page(kernel_pagemap, temp_vaddr);
 
         zero_start += clear_size;
         zero_size -= clear_size;
@@ -270,46 +272,58 @@ int elf_exec(const char *path, char *const argv[], char *const envp[]) {
     return -1;
   }
 
-  uint64_t user_stack = 0x7FFFFFFFE000;
-  void *stack_phys_ptr = pmm_alloc(1);
-  if (!stack_phys_ptr) {
+  page_table_t *new_pagemap = vmm_new_pagemap();
+  if (!new_pagemap) {
+    kprint("ELF: Failed to allocate pagemap\n");
     kfree(buffer);
     return -1;
   }
-  uint64_t stack_phys = (uint64_t)stack_phys_ptr;
 
-  page_table_t *current_pagemap = vmm_get_kernel_pagemap();
-  if (!vmm_map_page(current_pagemap, user_stack, stack_phys,
+  uint64_t entry_point = elf_load(new_pagemap, buffer, bytes_read);
+  kfree(buffer);
+  if (!entry_point) {
+    vmm_destroy_pagemap(new_pagemap);
+    return -1;
+  }
+
+  const uint64_t user_stack_base = 0x7FFFFFFFE000ULL;
+  void *stack_phys_ptr = pmm_alloc_zero(1);
+  if (!stack_phys_ptr) {
+    vmm_destroy_pagemap(new_pagemap);
+    return -1;
+  }
+
+  uint64_t stack_phys = (uint64_t)stack_phys_ptr;
+  if (!vmm_map_page(new_pagemap, user_stack_base, stack_phys,
                     VMM_PRESENT | VMM_WRITABLE | VMM_USER)) {
     kprint("ELF: Failed to map user stack\n");
     pmm_free(stack_phys_ptr, 1);
-    kfree(buffer);
+    vmm_destroy_pagemap(new_pagemap);
     return -1;
   }
 
-  // Map the stack temporarily to set it up
-  uint64_t temp_stack_vaddr = 0xFFFF900001000000;
-  if (!vmm_map_page(current_pagemap, temp_stack_vaddr, stack_phys,
+  page_table_t *kernel_pagemap = vmm_get_kernel_pagemap();
+  uint64_t temp_stack_vaddr = 0xFFFF900001000000ULL;
+  if (!vmm_map_page(kernel_pagemap, temp_stack_vaddr, stack_phys,
                     VMM_PRESENT | VMM_WRITABLE)) {
     kprint("ELF: Failed to create temporary stack mapping\n");
+    vmm_unmap_page(new_pagemap, user_stack_base);
     pmm_free(stack_phys_ptr, 1);
-    kfree(buffer);
+    vmm_destroy_pagemap(new_pagemap);
     return -1;
   }
 
-  // Set up stack at the temporary mapping
   uint64_t rsp = temp_stack_vaddr + PAGE_SIZE;
 
   int argc = 0;
   if (argv) {
-    while (argv[argc])
+    while (argv[argc]) {
       argc++;
+    }
   }
 
-  // Build argv array on stack
   if (argc > 0) {
-    // First, copy all strings to stack
-    char *string_area = (char *)(rsp - 1024); // Reserve space for strings
+    char *string_area = (char *)(rsp - 1024);
     char *string_ptr = string_area;
     uint64_t *argv_array =
         (uint64_t *)(string_area - (argc + 1) * sizeof(uint64_t));
@@ -317,63 +331,61 @@ int elf_exec(const char *path, char *const argv[], char *const envp[]) {
     for (int i = 0; i < argc; i++) {
       size_t len = strlen(argv[i]) + 1;
       memcpy(string_ptr, argv[i], len);
-      // Calculate the user-space address for this string
-      argv_array[i] =
-          user_stack + PAGE_SIZE - 1024 + (string_ptr - string_area);
+      argv_array[i] = user_stack_base + PAGE_SIZE - 1024 +
+                      (uint64_t)(string_ptr - string_area);
       string_ptr += len;
     }
     argv_array[argc] = 0;
 
-    // Set up initial stack with argc and argv
     rsp = (uint64_t)argv_array;
     rsp -= sizeof(uint64_t);
-    *(uint64_t *)rsp = user_stack + PAGE_SIZE - 1024 -
-                       (argc + 1) * sizeof(uint64_t); // argv in user space
+    *(uint64_t *)rsp =
+        user_stack_base + PAGE_SIZE - 1024 - (argc + 1) * sizeof(uint64_t);
 
     rsp -= sizeof(uint64_t);
     *(uint64_t *)rsp = argc;
   } else {
     rsp -= sizeof(uint64_t);
-    *(uint64_t *)rsp = 0; // argv
+    *(uint64_t *)rsp = 0;
     rsp -= sizeof(uint64_t);
-    *(uint64_t *)rsp = 0; // argc
+    *(uint64_t *)rsp = 0;
   }
 
-  // Align stack
-  rsp &= ~0xF;
+  rsp &= ~0xFULL;
 
-  // Calculate the actual user RSP
-  uint64_t user_rsp = user_stack + (rsp - temp_stack_vaddr);
+  uint64_t user_rsp = user_stack_base + (rsp - temp_stack_vaddr);
 
-  // Unmap the temporary stack mapping
-  vmm_unmap_page(current_pagemap, temp_stack_vaddr);
+  vmm_unmap_page(kernel_pagemap, temp_stack_vaddr);
 
-  uint64_t entry_point = elf_load(buffer, bytes_read);
-  kfree(buffer);
+  page_table_t *old_pagemap = current->pagemap;
+  bool old_owned = current->owns_pagemap;
 
-  if (!entry_point) {
-    kprint("ELF: Failed to load ELF segments\n");
-    return -1;
-  }
+  current->pagemap = new_pagemap;
+  current->owns_pagemap = true;
+
+  process_ensure_standard_streams(current);
 
   strncpy(current->name, path, 63);
   current->name[63] = '\0';
 
   current->context.rip = entry_point;
   current->context.rsp = user_rsp;
-  current->context.cs = 0x23; // User code segment
-  current->context.ss = 0x1B; // User data segment
+  current->context.cs = 0x23;
+  current->context.ss = 0x1B;
   current->context.rflags = 0x202;
 
   current->brk = (void *)0x10000000;
   current->brk_start = current->brk;
 
+  vmm_switch_pagemap(new_pagemap);
+
+  if (old_owned && old_pagemap && old_pagemap != new_pagemap) {
+    vmm_destroy_pagemap(old_pagemap);
+  }
+
   (void)envp;
 
-  // Actually jump to user mode and execute the program
   enter_usermode((void *)entry_point, (void *)user_rsp);
-
-  // We'll only get here when the program exits via syscall
 
   return 0;
 }
