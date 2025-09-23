@@ -80,6 +80,7 @@ static process_t *create_idle_process(uint32_t cpu_id) {
   idle->state = PROCESS_STATE_READY;
   idle->time_slice = DEFAULT_TIME_SLICE;
   idle->ticks_remaining = DEFAULT_TIME_SLICE;
+  idle->sleep_until_tick = 0;
   idle->stack_size = KERNEL_STACK_SIZE;
   idle->stack = kmalloc(KERNEL_STACK_SIZE);
   if (!idle->stack) {
@@ -184,6 +185,7 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
   process->state = PROCESS_STATE_READY;
   process->time_slice = DEFAULT_TIME_SLICE;
   process->ticks_remaining = DEFAULT_TIME_SLICE;
+  process->sleep_until_tick = 0;
 
   for (int i = 0; i < 256; i++) {
     process->fd_table[i] = -1;
@@ -334,7 +336,13 @@ void process_sleep(uint32_t milliseconds) {
   process_t *proc = get_current_process_local();
   if (proc && scheduler_enabled) {
     proc->state = PROCESS_STATE_BLOCKED;
-    proc->ticks_remaining = (milliseconds * PIT_DEFAULT_FREQUENCY) / 1000;
+    uint64_t ticks =
+        ((uint64_t)milliseconds * PIT_DEFAULT_FREQUENCY + 999) / 1000;
+    if (ticks == 0) {
+      ticks = 1;
+    }
+    proc->sleep_until_tick = pit_get_ticks() + ticks;
+    proc->ticks_remaining = 0;
     schedule();
   } else {
     pit_sleep(milliseconds);
@@ -345,6 +353,7 @@ void process_wake(process_t *process) {
   if (process && process->state == PROCESS_STATE_BLOCKED) {
     process->state = PROCESS_STATE_READY;
     process->ticks_remaining = process->time_slice;
+    process->sleep_until_tick = 0;
   }
 }
 
@@ -437,12 +446,19 @@ void scheduler_tick(void) {
 
   current->total_ticks++;
 
+  uint64_t current_ticks = pit_get_ticks();
   process_t *p = process_list_head;
   while (p) {
-    if (p->state == PROCESS_STATE_BLOCKED && p->ticks_remaining > 0) {
-      p->ticks_remaining--;
-      if (p->ticks_remaining == 0) {
-        process_wake(p);
+    if (p->state == PROCESS_STATE_BLOCKED) {
+      if (p->sleep_until_tick != 0) {
+        if ((int64_t)(current_ticks - p->sleep_until_tick) >= 0) {
+          process_wake(p);
+        }
+      } else if (p->ticks_remaining > 0) {
+        p->ticks_remaining--;
+        if (p->ticks_remaining == 0) {
+          process_wake(p);
+        }
       }
     }
     p = p->next;
@@ -593,6 +609,7 @@ process_t *process_fork(void) {
   uint64_t stack_offset = (uint64_t)child->stack - (uint64_t)parent->stack;
   child->context.rsp += stack_offset;
   child->context.rbp += stack_offset;
+  child->sleep_until_tick = 0;
 
   spin_lock(&pid_counter_lock);
   child->pid = next_pid++;

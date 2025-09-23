@@ -61,8 +61,6 @@ void kprint(const char *str) {
     return;
   }
 
-  bool flush_after = false;
-
   while (*str) {
     char c = *str++;
 
@@ -71,17 +69,12 @@ void kprint(const char *str) {
     }
 
     cpu->console_buffer[cpu->console_buffer_len++] = c;
-
     if (c == '\n') {
       console_flush(cpu);
-    } else if (c == '\r' || c == '\b') {
-      flush_after = true;
     }
   }
 
-  if (flush_after) {
-    console_flush(cpu);
-  }
+  console_flush(cpu);
 }
 
 void kputchar(char c) {

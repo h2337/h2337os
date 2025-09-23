@@ -55,6 +55,7 @@ typedef struct process {
   uint64_t time_slice;
   uint64_t ticks_remaining;
   uint64_t total_ticks;
+  uint64_t sleep_until_tick;
 
   void *brk;
   void *brk_start;
