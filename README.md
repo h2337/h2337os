@@ -7,12 +7,6 @@ A 64-bit monolithic hobby OS for x86_64, hand-rolled in C with Limine boot, FAT3
 - Processes: 256 slots, SMP, preemptive round-robin on PIT 100 Hz, states (Ready/Running/Blocked/Terminated/Zombie), fork/exec parenting, ELF64 (ET_EXEC/ET_DYN) loader, ring0↔ring3 hops, per-process FDs, cwd, and address space.
 - Storage: VFS layer, FAT32 with LFN, create/read/write/delete for files and dirs, RAM-backed root disk, multiple mount points.
 
-## Syscalls ×26
-`write`, `read`, `open`, `close`, `exit`, `fork`, `execve`, `waitpid`, `getpid`, `getppid`, `brk`, `mmap`, `munmap`, `time`, `getcwd`, `chdir`, `mkdir`, `rmdir`, `lseek`, `stat`, `fstat`, `ioctl`, `dup`, `dup2`, `pipe`, `unlink` via INT 0x80.
-
-## Shell ×25
-`help`, `about`, `uptime`, `mem`, `timer`, `reboot`, `shutdown`, `ps`, `spawn`, `kill`, `exec`, `usermode`, `ls`, `cat`, `write`, `touch`, `mkdir`, `rm`, `pwd`, `cd`, `echo`, `clear`, `hex`, `sleep`, `test`, `lspci`.
-
 ## Drivers & Devices
 PS/2 keyboard (full scancodes, Shift/Ctrl/Alt, Caps/Num/Scroll lock), COM1–COM4 serial debug, Flanterm VGA text console with cursor+scroll, PCI bus scan with config access, 8254 PIT timer, 8259 PIC interrupts.
 
