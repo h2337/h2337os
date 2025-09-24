@@ -1,6 +1,7 @@
 #ifndef FAT32_H
 #define FAT32_H
 
+#include "block.h"
 #include "vfs.h"
 #include <stdint.h>
 
@@ -77,15 +78,18 @@ typedef struct __attribute__((packed)) {
 
 typedef struct fat32_fs {
   fat32_bpb_t bpb;
-  uint32_t fat_start_lba;
-  uint32_t cluster_start_lba;
+  uint64_t fat_start_lba;
+  uint64_t data_start_lba;
   uint32_t sectors_per_cluster;
   uint32_t bytes_per_cluster;
   uint32_t total_clusters;
+  uint32_t fat_sectors;
   uint32_t *fat_buffer;
   uint8_t *cluster_buffer;
   uint8_t *data_region; // RAM-based storage for clusters
-  void *device;
+  block_device_t *block;
+  uint64_t partition_lba;
+  uint8_t fat_count;
 } fat32_fs_t;
 
 typedef struct fat32_node {
@@ -103,6 +107,8 @@ void fat32_init(void);
 vfs_filesystem_t *fat32_get_filesystem(void);
 vfs_node_t *fat32_mount(const char *device, const char *mountpoint);
 vfs_node_t *fat32_mount_ramdisk(uint8_t *data, uint64_t size);
+vfs_node_t *fat32_mount_block_device(block_device_t *device,
+                                     uint64_t lba_offset);
 void fat32_unmount(vfs_node_t *node);
 
 uint32_t fat32_read(vfs_node_t *node, uint32_t offset, uint32_t size,

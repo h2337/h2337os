@@ -37,8 +37,8 @@ static vfs_filesystem_t fat32_filesystem = {.name = "fat32",
                                             .unmount = fat32_unmount,
                                             .next = NULL};
 
-static uint32_t fat32_cluster_to_lba(fat32_fs_t *fs, uint32_t cluster) {
-  return fs->cluster_start_lba + (cluster - 2) * fs->sectors_per_cluster;
+static uint64_t fat32_cluster_to_lba(fat32_fs_t *fs, uint32_t cluster) {
+  return fs->data_start_lba + (uint64_t)(cluster - 2) * fs->sectors_per_cluster;
 }
 
 static uint32_t fat32_get_fat_entry(fat32_fs_t *fs, uint32_t cluster) {
@@ -48,12 +48,67 @@ static uint32_t fat32_get_fat_entry(fat32_fs_t *fs, uint32_t cluster) {
   return fs->fat_buffer[cluster] & 0x0FFFFFFF;
 }
 
+static int fat32_flush_fat_entry(fat32_fs_t *fs, uint32_t cluster) {
+  if (!fs->block) {
+    return 0;
+  }
+
+  uint32_t bytes_per_sector = fs->bpb.bytes_per_sector;
+  uint32_t fat_offset = cluster * 4;
+  uint32_t sector_index = fat_offset / bytes_per_sector;
+  uint32_t sector_offset = fat_offset % bytes_per_sector;
+  uint32_t value = fs->fat_buffer[cluster] & 0x0FFFFFFF;
+  uint8_t stack_sector[FAT32_SECTOR_SIZE];
+  uint8_t *sector = stack_sector;
+  bool allocated = false;
+
+  if (bytes_per_sector > FAT32_SECTOR_SIZE) {
+    sector = kmalloc(bytes_per_sector);
+    if (!sector) {
+      return -1;
+    }
+    allocated = true;
+  }
+
+  for (uint8_t copy = 0; copy < fs->fat_count; copy++) {
+    uint64_t lba =
+        fs->fat_start_lba + (uint64_t)copy * fs->fat_sectors + sector_index;
+    if (block_device_read(fs->block, lba, 1, sector) != 0) {
+      if (allocated) {
+        kfree(sector);
+      }
+      return -1;
+    }
+
+    uint32_t *entry_ptr = (uint32_t *)(sector + sector_offset);
+    *entry_ptr = (*entry_ptr & 0xF0000000) | value;
+
+    if (block_device_write(fs->block, lba, 1, sector) != 0) {
+      if (allocated) {
+        kfree(sector);
+      }
+      return -1;
+    }
+  }
+
+  if (allocated) {
+    kfree(sector);
+  }
+
+  return 0;
+}
+
 static void fat32_set_fat_entry(fat32_fs_t *fs, uint32_t cluster,
                                 uint32_t value) {
   if (!fs->fat_buffer) {
     return;
   }
   fs->fat_buffer[cluster] = value & 0x0FFFFFFF;
+  if (fs->block) {
+    if (fat32_flush_fat_entry(fs, cluster) != 0) {
+      kprint("FAT32: failed to flush FAT entry\n");
+    }
+  }
 }
 
 static uint32_t fat32_find_free_cluster(fat32_fs_t *fs) {
@@ -71,6 +126,15 @@ static int fat32_read_cluster(fat32_fs_t *fs, uint32_t cluster,
     return -1;
   }
 
+  if (fs->block) {
+    uint64_t lba = fat32_cluster_to_lba(fs, cluster);
+    if (block_device_read(fs->block, lba, fs->sectors_per_cluster, buffer) !=
+        0) {
+      return -1;
+    }
+    return 0;
+  }
+
   // Copy from RAM storage
   uint32_t offset = (cluster - 2) * fs->bytes_per_cluster;
   if (fs->data_region) {
@@ -86,6 +150,15 @@ static int fat32_write_cluster(fat32_fs_t *fs, uint32_t cluster,
                                uint8_t *buffer) {
   if (cluster < 2 || cluster >= FAT32_EOC || cluster >= fs->total_clusters) {
     return -1;
+  }
+
+  if (fs->block) {
+    uint64_t lba = fat32_cluster_to_lba(fs, cluster);
+    if (block_device_write(fs->block, lba, fs->sectors_per_cluster, buffer) !=
+        0) {
+      return -1;
+    }
+    return 0;
   }
 
   // Copy to RAM storage
@@ -399,7 +472,7 @@ vfs_node_t *fat32_readdir(vfs_node_t *node, uint32_t index) {
         return NULL;
       }
 
-      if (entries[i].name[0] == 0xE5) {
+      if ((uint8_t)entries[i].name[0] == 0xE5) {
         continue;
       }
 
@@ -460,7 +533,7 @@ vfs_node_t *fat32_finddir(vfs_node_t *node, const char *name) {
         return NULL;
       }
 
-      if (entries[i].name[0] == 0xE5) {
+      if ((uint8_t)entries[i].name[0] == 0xE5) {
         continue;
       }
 
@@ -530,7 +603,7 @@ int fat32_create(vfs_node_t *parent, const char *name, uint32_t type,
         fs->bytes_per_cluster / sizeof(fat32_dir_entry_t);
 
     for (uint32_t i = 0; i < entries_per_cluster; i++) {
-      if (entries[i].name[0] == 0x00 || entries[i].name[0] == 0xE5) {
+      if (entries[i].name[0] == 0x00 || (uint8_t)entries[i].name[0] == 0xE5) {
         memcpy(&entries[i], &new_entry, sizeof(fat32_dir_entry_t));
         fat32_write_cluster(fs, cluster, fs->cluster_buffer);
 
@@ -606,7 +679,7 @@ int fat32_unlink(vfs_node_t *parent, const char *name) {
         return -1;
       }
 
-      if (entries[i].name[0] == 0xE5) {
+      if ((uint8_t)entries[i].name[0] == 0xE5) {
         continue;
       }
 
@@ -636,8 +709,18 @@ int fat32_unlink(vfs_node_t *parent, const char *name) {
 }
 
 vfs_node_t *fat32_mount(const char *device, const char *mountpoint) {
-  (void)device;
   (void)mountpoint;
+
+  if (device && device[0]) {
+    block_device_t *blk = block_device_find(device);
+    if (blk) {
+      vfs_node_t *root = fat32_mount_block_device(blk, 0);
+      if (root) {
+        return root;
+      }
+      kprint("FAT32: failed to mount block device, falling back to RAM\n");
+    }
+  }
 
   fat32_fs_t *fs = kmalloc(sizeof(fat32_fs_t));
   if (!fs) {
@@ -649,6 +732,20 @@ vfs_node_t *fat32_mount(const char *device, const char *mountpoint) {
   fs->sectors_per_cluster = 8;
   fs->bytes_per_cluster = fs->sectors_per_cluster * FAT32_SECTOR_SIZE;
   fs->total_clusters = 1024;
+  fs->block = NULL;
+  fs->partition_lba = 0;
+  fs->fat_start_lba = 0;
+  fs->data_start_lba = 0;
+  fs->fat_count = 1;
+  fs->fat_sectors =
+      (fs->total_clusters * sizeof(uint32_t) + FAT32_SECTOR_SIZE - 1) /
+      FAT32_SECTOR_SIZE;
+  memset(&fs->bpb, 0, sizeof(fs->bpb));
+  fs->bpb.bytes_per_sector = FAT32_SECTOR_SIZE;
+  fs->bpb.sectors_per_cluster = fs->sectors_per_cluster;
+  fs->bpb.number_of_fats = 1;
+  fs->bpb.fat_size_32 = fs->fat_sectors;
+  fs->bpb.root_cluster = 2;
 
   fs->fat_buffer = kmalloc(fs->total_clusters * sizeof(uint32_t));
   if (!fs->fat_buffer) {
@@ -768,6 +865,14 @@ vfs_node_t *fat32_mount_ramdisk(uint8_t *data, uint64_t size) {
   uint32_t fat_offset = bpb->reserved_sectors * bpb->bytes_per_sector;
   uint32_t data_offset = fat_offset + (fat_sectors * bpb->bytes_per_sector);
 
+  fs->block = NULL;
+  fs->partition_lba = 0;
+  fs->fat_start_lba = 0;
+  fs->data_start_lba = 0;
+  fs->fat_count = bpb->number_of_fats;
+  fs->fat_sectors = bpb->fat_size_32;
+  memcpy(&fs->bpb, bpb, sizeof(fat32_bpb_t));
+
   // Set up FAT buffer
   fs->fat_buffer = kmalloc(fs->total_clusters * sizeof(uint32_t));
   if (!fs->fat_buffer) {
@@ -776,8 +881,8 @@ vfs_node_t *fat32_mount_ramdisk(uint8_t *data, uint64_t size) {
   }
 
   // Copy FAT from ramdisk
-  memcpy(fs->fat_buffer, data + fat_offset,
-         bpb->fat_size_32 * bpb->bytes_per_sector);
+  uint32_t fat_bytes = fs->total_clusters * sizeof(uint32_t);
+  memcpy(fs->fat_buffer, data + fat_offset, fat_bytes);
 
   fs->cluster_buffer = kmalloc(fs->bytes_per_cluster);
   if (!fs->cluster_buffer) {
@@ -821,6 +926,144 @@ vfs_node_t *fat32_mount_ramdisk(uint8_t *data, uint64_t size) {
 
   kprint("FAT32 filesystem mounted from ramdisk\n");
 
+  return (vfs_node_t *)root;
+}
+
+vfs_node_t *fat32_mount_block_device(block_device_t *device,
+                                     uint64_t lba_offset) {
+  if (!device) {
+    return NULL;
+  }
+
+  uint32_t sector_size = device->block_size;
+  if (sector_size < sizeof(fat32_bpb_t)) {
+    kprint("FAT32: sector too small\n");
+    return NULL;
+  }
+
+  uint8_t *sector = kmalloc(sector_size);
+  if (!sector) {
+    return NULL;
+  }
+
+  if (block_device_read(device, lba_offset, 1, sector) != 0) {
+    kfree(sector);
+    return NULL;
+  }
+
+  fat32_bpb_t *bpb = (fat32_bpb_t *)sector;
+  if (bpb->boot_signature != 0x29) {
+    kprint("FAT32: invalid boot signature\n");
+    kfree(sector);
+    return NULL;
+  }
+
+  fat32_fs_t *fs = kmalloc(sizeof(fat32_fs_t));
+  if (!fs) {
+    kfree(sector);
+    return NULL;
+  }
+
+  memset(fs, 0, sizeof(fat32_fs_t));
+
+  uint32_t bytes_per_sector = bpb->bytes_per_sector;
+  if (bytes_per_sector == 0) {
+    bytes_per_sector = FAT32_SECTOR_SIZE;
+  }
+
+  fs->sectors_per_cluster = bpb->sectors_per_cluster;
+  fs->bytes_per_cluster = fs->sectors_per_cluster * bytes_per_sector;
+
+  uint64_t total_sectors =
+      bpb->total_sectors_32 ? bpb->total_sectors_32 : bpb->total_sectors_16;
+  uint64_t fat_sectors = (uint64_t)bpb->fat_size_32 * bpb->number_of_fats;
+  uint64_t data_sectors = total_sectors - (bpb->reserved_sectors + fat_sectors);
+  fs->total_clusters = (uint32_t)(data_sectors / fs->sectors_per_cluster);
+
+  fs->fat_start_lba = lba_offset + bpb->reserved_sectors;
+  fs->fat_sectors = bpb->fat_size_32;
+  fs->fat_count = bpb->number_of_fats;
+  fs->partition_lba = lba_offset;
+  fs->data_start_lba =
+      fs->fat_start_lba + (uint64_t)bpb->number_of_fats * bpb->fat_size_32;
+  fs->block = device;
+  memcpy(&fs->bpb, bpb, sizeof(fat32_bpb_t));
+
+  fs->fat_buffer = kmalloc(fs->total_clusters * sizeof(uint32_t));
+  if (!fs->fat_buffer) {
+    kfree(fs);
+    kfree(sector);
+    return NULL;
+  }
+
+  uint32_t cluster_buffer_size = fs->bytes_per_cluster;
+  fs->cluster_buffer = kmalloc(cluster_buffer_size);
+  if (!fs->cluster_buffer) {
+    kfree(fs->fat_buffer);
+    kfree(fs);
+    kfree(sector);
+    return NULL;
+  }
+
+  fs->data_region = NULL;
+
+  uint64_t fat_bytes_total = (uint64_t)bpb->fat_size_32 * bytes_per_sector;
+  uint8_t *fat_temp = kmalloc(fat_bytes_total);
+  if (!fat_temp) {
+    kfree(fs->cluster_buffer);
+    kfree(fs->fat_buffer);
+    kfree(fs);
+    kfree(sector);
+    return NULL;
+  }
+
+  for (uint32_t i = 0; i < bpb->fat_size_32; i++) {
+    if (block_device_read(device, fs->fat_start_lba + i, 1,
+                          fat_temp + (uint64_t)i * bytes_per_sector) != 0) {
+      kfree(fat_temp);
+      kfree(fs->cluster_buffer);
+      kfree(fs->fat_buffer);
+      kfree(fs);
+      kfree(sector);
+      return NULL;
+    }
+  }
+
+  uint32_t entries = (uint32_t)(fat_bytes_total / 4);
+  uint32_t limit = fs->total_clusters < entries ? fs->total_clusters : entries;
+  uint32_t *fat_entries = (uint32_t *)fat_temp;
+  for (uint32_t i = 0; i < limit; i++) {
+    fs->fat_buffer[i] = fat_entries[i] & 0x0FFFFFFF;
+  }
+  for (uint32_t i = limit; i < fs->total_clusters; i++) {
+    fs->fat_buffer[i] = FAT32_FREE_CLUSTER;
+  }
+
+  kfree(fat_temp);
+
+  fat32_dir_entry_t root_entry;
+  memset(&root_entry, 0, sizeof(fat32_dir_entry_t));
+  memset(root_entry.name, ' ', 11);
+  root_entry.name[0] = '/';
+  root_entry.attr = FAT32_ATTR_DIRECTORY;
+  root_entry.first_cluster_hi = (bpb->root_cluster >> 16) & 0xFFFF;
+  root_entry.first_cluster_lo = bpb->root_cluster & 0xFFFF;
+
+  fat32_node_t *root = fat32_create_node(fs, &root_entry, "/");
+  if (!root) {
+    kfree(fs->cluster_buffer);
+    kfree(fs->fat_buffer);
+    kfree(fs);
+    kfree(sector);
+    return NULL;
+  }
+
+  root->base.fs = &fat32_filesystem;
+  strcpy(root->base.name, "/");
+
+  kprint("FAT32 filesystem mounted from block device\n");
+
+  kfree(sector);
   return (vfs_node_t *)root;
 }
 

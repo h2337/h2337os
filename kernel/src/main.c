@@ -1,3 +1,5 @@
+#include "ahci.h"
+#include "block.h"
 #include "console.h"
 #include "fat32.h"
 #include "flanterm/flanterm.h"
@@ -7,6 +9,7 @@
 #include "idt.h"
 #include "keyboard.h"
 #include "limine_requests.h"
+#include "pci.h"
 #include "pic.h"
 #include "pit.h"
 #include "pmm.h"
@@ -57,6 +60,10 @@ void kmain(void) {
   pmm_init();
   vmm_init();
   heap_init();
+
+  block_init();
+  pci_init();
+  ahci_init();
 
   kprint("\n=== Initializing SMP ===\n");
   smp_init();

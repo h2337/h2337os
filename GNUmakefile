@@ -91,17 +91,27 @@ $(IMAGE_NAME).iso: limine/limine kernel rootfs.img
 	rm -rf iso_root
 
 $(IMAGE_NAME).hdd: limine/limine kernel rootfs.img
-	rm -f $(IMAGE_NAME).hdd
-	dd if=/dev/zero bs=1M count=0 seek=64 of=$(IMAGE_NAME).hdd
-	PATH=$$PATH:/usr/sbin:/sbin sgdisk $(IMAGE_NAME).hdd -n 1:2048 -t 1:ef00 -m 1
-	./limine/limine bios-install $(IMAGE_NAME).hdd
-	mformat -i $(IMAGE_NAME).hdd@@1M
-	mmd -i $(IMAGE_NAME).hdd@@1M ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
-	mcopy -i $(IMAGE_NAME).hdd@@1M kernel/bin/kernel ::/boot
-	mcopy -i $(IMAGE_NAME).hdd@@1M rootfs.img ::/boot
-	mcopy -i $(IMAGE_NAME).hdd@@1M limine.conf limine/limine-bios.sys ::/boot/limine
-	mcopy -i $(IMAGE_NAME).hdd@@1M limine/BOOTX64.EFI ::/EFI/BOOT
-	mcopy -i $(IMAGE_NAME).hdd@@1M limine/BOOTIA32.EFI ::/EFI/BOOT
+	@if [ ! -f $(IMAGE_NAME).hdd ]; then \
+		dd if=/dev/zero bs=1M count=0 seek=64 of=$(IMAGE_NAME).hdd; \
+		PATH=$$PATH:/usr/sbin:/sbin sgdisk $(IMAGE_NAME).hdd -n 1:2048 -t 1:ef00 -m 1; \
+		./limine/limine bios-install $(IMAGE_NAME).hdd; \
+		mformat -F -i $(IMAGE_NAME).hdd@@1M; \
+		mmd -i $(IMAGE_NAME).hdd@@1M ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine 2>/dev/null || true; \
+		mcopy -i $(IMAGE_NAME).hdd@@1M kernel/bin/kernel ::/boot; \
+		mcopy -i $(IMAGE_NAME).hdd@@1M rootfs.img ::/boot; \
+		mcopy -i $(IMAGE_NAME).hdd@@1M limine.conf limine/limine-bios.sys ::/boot/limine; \
+		mcopy -i $(IMAGE_NAME).hdd@@1M limine/BOOTX64.EFI ::/EFI/BOOT; \
+		mcopy -i $(IMAGE_NAME).hdd@@1M limine/BOOTIA32.EFI ::/EFI/BOOT; \
+		find rootfs -type d | while IFS= read -r dir; do \
+		  rel=$${dir#rootfs}; \
+		  [ "$$rel" = "" ] && continue; \
+		  mmd -i $(IMAGE_NAME).hdd@@1M ::$$rel 2>/dev/null || true; \
+		done; \
+		find rootfs -type f | while IFS= read -r file; do \
+		  rel=$${file#rootfs/}; \
+		  mcopy -i $(IMAGE_NAME).hdd@@1M "$$file" ::/"$$rel"; \
+		done; \
+	fi
 
 .PHONY: clean
 clean:
