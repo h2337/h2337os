@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "types.h"
 #include "vmm.h"
 
 #define MAX_PROCESSES 256
@@ -43,6 +44,17 @@ typedef struct context {
   uint64_t ss;
 } __attribute__((packed)) context_t;
 
+typedef struct vm_region {
+  uint64_t start;
+  uint64_t end;
+  uint64_t flags;
+  int prot;
+  int map_flags;
+  int fd;
+  off_t offset;
+  struct vm_region *next;
+} vm_region_t;
+
 typedef struct process {
   uint32_t pid;
   uint32_t ppid;
@@ -73,6 +85,9 @@ typedef struct process {
 
   struct process *next;
   struct process *prev;
+
+  vm_region_t *vm_regions;
+  uint64_t mmap_base;
 } process_t;
 
 void process_init(void);
@@ -93,6 +108,15 @@ process_t *process_fork(void);
 int process_waitpid(int pid, int *status, int options);
 void *process_sbrk(intptr_t increment);
 void process_ensure_standard_streams(process_t *proc);
+vm_region_t *process_vm_find_region(process_t *proc, uint64_t addr);
+vm_region_t *process_vm_add_region(process_t *proc, uint64_t start,
+                                   uint64_t length, int prot, int flags,
+                                   int fd, off_t offset);
+int process_vm_remove_region(process_t *proc, uint64_t start,
+                             uint64_t length);
+void process_vm_clear_regions(process_t *proc);
+uint64_t process_vm_reserve_addr(process_t *proc, size_t length);
+void process_vm_unmap_range(process_t *proc, uint64_t start, uint64_t length);
 void scheduler_init(void);
 void scheduler_tick(void);
 void schedule(void);

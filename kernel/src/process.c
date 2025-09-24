@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 #define IDLE_PID_BASE 0xFFFF0000U
+#define PROCESS_DEFAULT_MMAP_BASE 0x2000000000ULL
 
 static process_t *process_list_head = NULL;
 static process_t *current_processes[SMP_MAX_CPUS] = {0};
@@ -51,6 +52,196 @@ static inline bool is_idle_for_other_cpu(process_t *process, uint32_t cpu_id) {
     }
   }
   return false;
+}
+
+static inline uint64_t align_down(uint64_t value, uint64_t align) {
+  return value & ~(align - 1);
+}
+
+static inline uint64_t align_up(uint64_t value, uint64_t align) {
+  return (value + align - 1) & ~(align - 1);
+}
+
+static bool vm_region_conflicts(vm_region_t *head, uint64_t start,
+                                uint64_t end) {
+  vm_region_t *region = head;
+  while (region) {
+    if (!(end <= region->start || start >= region->end)) {
+      return true;
+    }
+    region = region->next;
+  }
+  return false;
+}
+
+static vm_region_t *vm_region_clone_list(vm_region_t *head) {
+  vm_region_t *new_head = NULL;
+  vm_region_t **tail = &new_head;
+
+  while (head) {
+    vm_region_t *node = kmalloc(sizeof(vm_region_t));
+    if (!node) {
+      vm_region_t *iter = new_head;
+      while (iter) {
+        vm_region_t *next = iter->next;
+        kfree(iter);
+        iter = next;
+      }
+      return NULL;
+    }
+
+    *node = *head;
+    node->next = NULL;
+    *tail = node;
+    tail = &node->next;
+    head = head->next;
+  }
+
+  return new_head;
+}
+
+static void vm_region_free_list(vm_region_t *head) {
+  while (head) {
+    vm_region_t *next = head->next;
+    kfree(head);
+    head = next;
+  }
+}
+
+uint64_t process_vm_reserve_addr(process_t *proc, size_t length) {
+  if (!proc) {
+    return 0;
+  }
+
+  uint64_t aligned_length = align_up((uint64_t)length, PAGE_SIZE);
+  if (aligned_length == 0) {
+    aligned_length = PAGE_SIZE;
+  }
+
+  uint64_t base = align_up(proc->mmap_base, PAGE_SIZE);
+  uint64_t end = base + aligned_length;
+
+  if (end < base || end >= 0x0000800000000000ULL) {
+    return 0;
+  }
+
+  proc->mmap_base = end;
+  return base;
+}
+
+vm_region_t *process_vm_add_region(process_t *proc, uint64_t start,
+                                   uint64_t length, int prot, int flags,
+                                   int fd, off_t offset) {
+  if (!proc || length == 0) {
+    return NULL;
+  }
+
+  uint64_t aligned_start = align_down(start, PAGE_SIZE);
+  uint64_t aligned_length = align_up(length, PAGE_SIZE);
+  uint64_t aligned_end = aligned_start + aligned_length;
+
+  if (aligned_end <= aligned_start) {
+    return NULL;
+  }
+
+  if (vm_region_conflicts(proc->vm_regions, aligned_start, aligned_end)) {
+    return NULL;
+  }
+
+  vm_region_t *region = kmalloc(sizeof(vm_region_t));
+  if (!region) {
+    return NULL;
+  }
+
+  region->start = aligned_start;
+  region->end = aligned_end;
+  region->flags = 0;
+  region->prot = prot;
+  region->map_flags = flags;
+  region->fd = fd;
+  region->offset = offset;
+  region->next = proc->vm_regions;
+  proc->vm_regions = region;
+  return region;
+}
+
+vm_region_t *process_vm_find_region(process_t *proc, uint64_t addr) {
+  if (!proc) {
+    return NULL;
+  }
+
+  uint64_t aligned_addr = align_down(addr, PAGE_SIZE);
+  vm_region_t *region = proc->vm_regions;
+  while (region) {
+    if (aligned_addr >= region->start && aligned_addr < region->end) {
+      return region;
+    }
+    region = region->next;
+  }
+  return NULL;
+}
+
+int process_vm_remove_region(process_t *proc, uint64_t start,
+                             uint64_t length) {
+  if (!proc || length == 0) {
+    return -1;
+  }
+
+  uint64_t aligned_start = align_down(start, PAGE_SIZE);
+  uint64_t aligned_length = align_up(length, PAGE_SIZE);
+  uint64_t aligned_end = aligned_start + aligned_length;
+
+  vm_region_t *prev = NULL;
+  vm_region_t *region = proc->vm_regions;
+
+  while (region) {
+    if (region->start == aligned_start && region->end == aligned_end) {
+      if (prev) {
+        prev->next = region->next;
+      } else {
+        proc->vm_regions = region->next;
+      }
+      kfree(region);
+      return 0;
+    }
+    prev = region;
+    region = region->next;
+  }
+
+  return -1;
+}
+
+void process_vm_unmap_range(process_t *proc, uint64_t start, uint64_t length) {
+  if (!proc || !proc->pagemap || length == 0) {
+    return;
+  }
+
+  uint64_t aligned_start = align_down(start, PAGE_SIZE);
+  uint64_t aligned_end = aligned_start + align_up(length, PAGE_SIZE);
+
+  for (uint64_t addr = aligned_start; addr < aligned_end; addr += PAGE_SIZE) {
+    uint64_t phys = vmm_get_phys(proc->pagemap, addr);
+    if (phys) {
+      if (vmm_unmap_page(proc->pagemap, addr)) {
+        pmm_ref_dec(phys);
+      }
+    }
+  }
+}
+
+void process_vm_clear_regions(process_t *proc) {
+  if (!proc) {
+    return;
+  }
+
+  vm_region_t *region = proc->vm_regions;
+  while (region) {
+    vm_region_t *next = region->next;
+    kfree(region);
+    region = next;
+  }
+  proc->vm_regions = NULL;
+  proc->mmap_base = PROCESS_DEFAULT_MMAP_BASE;
 }
 
 static process_t *get_current_process_local(void) {
@@ -100,6 +291,7 @@ static process_t *create_idle_process(uint32_t cpu_id) {
   idle->context.rflags = 0x202;
   idle->pagemap = vmm_get_kernel_pagemap();
   idle->owns_pagemap = false;
+  idle->mmap_base = PROCESS_DEFAULT_MMAP_BASE;
 
   for (int i = 0; i < 256; i++) {
     idle->fd_table[i] = -1;
@@ -168,6 +360,7 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
   }
 
   memset(process, 0, sizeof(process_t));
+  process->mmap_base = PROCESS_DEFAULT_MMAP_BASE;
 
   spin_lock(&pid_counter_lock);
   process->pid = next_pid++;
@@ -280,6 +473,8 @@ void process_destroy(process_t *process) {
   }
   process_count--;
   spin_unlock(&process_list_lock);
+
+  process_vm_clear_regions(process);
 
   if (process->stack) {
     kfree(process->stack);
@@ -591,12 +786,15 @@ process_t *process_fork(void) {
     return NULL;
   }
 
+  vm_region_t *cloned_regions = NULL;
+
   process_t *child = kmalloc(sizeof(process_t));
   if (!child) {
     return NULL;
   }
 
   memcpy(child, parent, sizeof(process_t));
+  child->vm_regions = NULL;
 
   child->stack = kmalloc(child->stack_size);
   if (!child->stack) {
@@ -624,9 +822,19 @@ process_t *process_fork(void) {
   child->next = NULL;
   child->prev = NULL;
 
+  cloned_regions = vm_region_clone_list(parent->vm_regions);
+  if (parent->vm_regions && !cloned_regions) {
+    kfree(child->stack);
+    kfree(child);
+    return NULL;
+  }
+
   if (parent->owns_pagemap && parent->pagemap) {
     page_table_t *clone_map = vmm_clone_user_pagemap(parent->pagemap);
     if (!clone_map) {
+      if (cloned_regions) {
+        vm_region_free_list(cloned_regions);
+      }
       kfree(child->stack);
       kfree(child);
       return NULL;
@@ -637,6 +845,9 @@ process_t *process_fork(void) {
     child->pagemap = parent->pagemap;
     child->owns_pagemap = false;
   }
+
+  child->vm_regions = cloned_regions;
+  child->mmap_base = parent->mmap_base;
 
   for (int i = 0; i < 256; i++) {
     int fd = child->fd_table[i];
@@ -758,54 +969,17 @@ void *process_sbrk(intptr_t increment) {
     return (void *)-1;
   }
 
-  uintptr_t old_page_aligned =
-      (current_brk + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
-  uintptr_t new_page_aligned =
-      (new_brk + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
-
-  if (increment > 0) {
-    for (uintptr_t addr = old_page_aligned; addr < new_page_aligned;
-         addr += PAGE_SIZE) {
-      void *phys_ptr = pmm_alloc_zero(1);
-      if (!phys_ptr) {
-        // Roll back previously mapped pages
-        for (uintptr_t rollback = old_page_aligned; rollback < addr;
-             rollback += PAGE_SIZE) {
-          uint64_t phys = vmm_get_phys(proc->pagemap, rollback);
-          if (phys) {
-            vmm_unmap_page(proc->pagemap, rollback);
-            pmm_free((void *)phys, 1);
-          }
-        }
-        return (void *)-1;
-      }
-
-      if (!vmm_map_page(proc->pagemap, addr, (uint64_t)phys_ptr,
-                        VMM_PRESENT | VMM_WRITABLE | VMM_USER)) {
-        pmm_free(phys_ptr, 1);
-        for (uintptr_t rollback = old_page_aligned; rollback < addr;
-             rollback += PAGE_SIZE) {
-          uint64_t phys = vmm_get_phys(proc->pagemap, rollback);
-          if (phys) {
-            vmm_unmap_page(proc->pagemap, rollback);
-            pmm_free((void *)phys, 1);
-          }
-        }
-        return (void *)-1;
-      }
-    }
-  } else {
-    for (uintptr_t addr = new_page_aligned; addr < old_page_aligned;
-         addr += PAGE_SIZE) {
-      uint64_t phys = vmm_get_phys(proc->pagemap, addr);
-      if (phys) {
-        vmm_unmap_page(proc->pagemap, addr);
-        pmm_free((void *)phys, 1);
-      }
-    }
-  }
+  uintptr_t old_page_aligned = align_up(current_brk, PAGE_SIZE);
+  uintptr_t new_page_aligned = align_up(new_brk, PAGE_SIZE);
 
   void *old_brk_ptr = (void *)current_brk;
+
+  if (increment < 0 && new_page_aligned < old_page_aligned) {
+    uint64_t range_start = new_page_aligned;
+    uint64_t range_len = old_page_aligned - new_page_aligned;
+    process_vm_unmap_range(proc, range_start, range_len);
+  }
+
   proc->brk = (void *)new_brk;
   return old_brk_ptr;
 }

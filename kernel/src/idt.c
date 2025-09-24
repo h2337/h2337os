@@ -3,8 +3,12 @@
 #include "keyboard.h"
 #include "pic.h"
 #include "pit.h"
+#include "pmm.h"
 #include "process.h"
 #include "smp.h"
+#include "vmm.h"
+#include "libc.h"
+#include "limine_requests.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -129,6 +133,136 @@ void irq_handler(struct interrupt_frame *frame) {
   }
 }
 
+static uint64_t get_hhdm_offset(void) {
+  if (hhdm_request.response) {
+    return hhdm_request.response->offset;
+  }
+  return 0;
+}
+
+static bool map_zero_page(process_t *proc, uint64_t page_addr, uint64_t flags) {
+  void *phys_ptr = pmm_alloc_zero(1);
+  if (!phys_ptr) {
+    return false;
+  }
+
+  if (!vmm_map_page(proc->pagemap, page_addr, (uint64_t)phys_ptr,
+                    flags | VMM_USER)) {
+    pmm_free(phys_ptr, 1);
+    return false;
+  }
+
+  return true;
+}
+
+static bool handle_cow_fault(process_t *proc, uint64_t page_addr) {
+  uint64_t entry = 0;
+  if (!vmm_get_entry(proc->pagemap, page_addr, &entry)) {
+    return false;
+  }
+
+  if (!(entry & VMM_COW)) {
+    return false;
+  }
+
+  uint64_t phys = entry & 0x000FFFFFFFFFF000ULL;
+  if (!phys) {
+    return false;
+  }
+
+  const uint64_t preserve_mask = VMM_USER | VMM_WRITE_THROUGH |
+                                 VMM_CACHE_DISABLE | VMM_GLOBAL |
+                                 VMM_NO_EXECUTE;
+  uint64_t base_flags = (entry & preserve_mask) | VMM_USER;
+
+  uint32_t refs = pmm_ref_get(phys);
+  if (refs > 1) {
+    void *new_phys_ptr = pmm_alloc(1);
+    if (!new_phys_ptr) {
+      return false;
+    }
+
+    uint64_t new_phys = (uint64_t)new_phys_ptr;
+    uint64_t hhdm = get_hhdm_offset();
+    if (!hhdm) {
+      pmm_free(new_phys_ptr, 1);
+      return false;
+    }
+
+    memcpy((void *)(new_phys + hhdm), (void *)(phys + hhdm), PAGE_SIZE);
+
+    uint64_t new_flags = base_flags | VMM_WRITABLE;
+    if (!vmm_map_page(proc->pagemap, page_addr, new_phys, new_flags)) {
+      pmm_free(new_phys_ptr, 1);
+      return false;
+    }
+
+    pmm_ref_dec(phys);
+  } else {
+    if (!vmm_update_entry(proc->pagemap, page_addr, VMM_WRITABLE,
+                          VMM_COW)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool handle_user_page_fault(struct interrupt_frame *frame) {
+  uint64_t fault_addr;
+  asm volatile("mov %%cr2, %0" : "=r"(fault_addr));
+
+  process_t *proc = process_get_current();
+  if (!proc || !proc->pagemap) {
+    return false;
+  }
+
+  bool user = (frame->err_code & (1 << 2)) != 0;
+  if (!user) {
+    return false;
+  }
+
+  bool present = (frame->err_code & 0x1) != 0;
+  bool write = (frame->err_code & 0x2) != 0;
+
+  uint64_t page_addr = fault_addr & ~(uint64_t)(PAGE_SIZE - 1);
+  bool in_heap = fault_addr >= (uint64_t)proc->brk_start &&
+                 fault_addr < (uint64_t)proc->brk;
+
+  vm_region_t *region = process_vm_find_region(proc, fault_addr);
+
+  if (!present) {
+    if (in_heap) {
+      uint64_t flags = VMM_NO_EXECUTE | VMM_WRITABLE | VMM_USER;
+      return map_zero_page(proc, page_addr, flags);
+    }
+
+    if (region) {
+      uint64_t flags = region->flags ? region->flags : (VMM_USER | VMM_NO_EXECUTE);
+      return map_zero_page(proc, page_addr, flags);
+    }
+
+    return false;
+  }
+
+  if (!write) {
+    return false;
+  }
+
+  if (in_heap) {
+    return handle_cow_fault(proc, page_addr);
+  }
+
+  if (region) {
+    if (!(region->flags & VMM_WRITABLE)) {
+      return false;
+    }
+    return handle_cow_fault(proc, page_addr);
+  }
+
+  return false;
+}
+
 void exception_handler(struct interrupt_frame *frame) {
   if (frame->int_no >= 32) {
     irq_handler(frame);
@@ -136,6 +270,10 @@ void exception_handler(struct interrupt_frame *frame) {
   }
 
   bool user_mode = (frame->cs & 0x3) == 0x3;
+
+  if (frame->int_no == 14 && handle_user_page_fault(frame)) {
+    return;
+  }
 
   kprint("\n=== EXCEPTION OCCURRED ===\n");
   kprint("Exception: ");

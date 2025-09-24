@@ -1,5 +1,6 @@
 #include "vmm.h"
 #include "console.h"
+#include "heap.h"
 #include "libc.h"
 #include "limine_requests.h"
 #include "pmm.h"
@@ -35,6 +36,31 @@ static uint64_t *get_next_level(uint64_t *current_level, size_t index,
   }
 
   return (uint64_t *)((entry & 0x000FFFFFFFFFF000) + hhdm_offset);
+}
+
+static uint64_t *get_pte_ptr(page_table_t *pagemap, uint64_t virt,
+                             bool allocate, uint64_t flags) {
+  size_t pml4_index = PML4_GET_INDEX(virt);
+  size_t pdp_index = PDP_GET_INDEX(virt);
+  size_t pd_index = PD_GET_INDEX(virt);
+  size_t pt_index = PT_GET_INDEX(virt);
+
+  uint64_t *pdp = get_next_level(pagemap->pml4, pml4_index, allocate, flags);
+  if (pdp == NULL) {
+    return NULL;
+  }
+
+  uint64_t *pd = get_next_level(pdp, pdp_index, allocate, flags);
+  if (pd == NULL) {
+    return NULL;
+  }
+
+  uint64_t *pt = get_next_level(pd, pd_index, allocate, flags);
+  if (pt == NULL) {
+    return NULL;
+  }
+
+  return &pt[pt_index];
 }
 
 void vmm_init(void) {
@@ -149,7 +175,15 @@ page_table_t *vmm_clone_user_pagemap(page_table_t *source) {
 
   const uint64_t phys_mask = 0x000FFFFFFFFFF000ULL;
   const uint64_t flags_mask = VMM_WRITABLE | VMM_USER | VMM_WRITE_THROUGH |
-                              VMM_CACHE_DISABLE | VMM_GLOBAL | VMM_NO_EXECUTE;
+                              VMM_CACHE_DISABLE | VMM_GLOBAL | VMM_NO_EXECUTE |
+                              VMM_COW;
+
+  typedef struct cow_patch {
+    uint64_t virt;
+    struct cow_patch *next;
+  } cow_patch_t;
+
+  cow_patch_t *patches = NULL;
 
   for (size_t pml4_index = 0; pml4_index < 256; pml4_index++) {
     uint64_t pml4_entry = source->pml4[pml4_index];
@@ -157,8 +191,7 @@ page_table_t *vmm_clone_user_pagemap(page_table_t *source) {
       continue;
     }
     if (pml4_entry & VMM_HUGE_PAGE) {
-      vmm_destroy_pagemap(clone);
-      return NULL;
+      goto clone_fail;
     }
 
     uint64_t *src_pdp = (uint64_t *)((pml4_entry & phys_mask) + hhdm_offset);
@@ -169,8 +202,7 @@ page_table_t *vmm_clone_user_pagemap(page_table_t *source) {
         continue;
       }
       if (pdp_entry & VMM_HUGE_PAGE) {
-        vmm_destroy_pagemap(clone);
-        return NULL;
+        goto clone_fail;
       }
 
       uint64_t *src_pd = (uint64_t *)((pdp_entry & phys_mask) + hhdm_offset);
@@ -182,8 +214,7 @@ page_table_t *vmm_clone_user_pagemap(page_table_t *source) {
         }
 
         if (pd_entry & VMM_HUGE_PAGE) {
-          vmm_destroy_pagemap(clone);
-          return NULL;
+          goto clone_fail;
         }
 
         uint64_t *src_pt = (uint64_t *)((pd_entry & phys_mask) + hhdm_offset);
@@ -195,39 +226,68 @@ page_table_t *vmm_clone_user_pagemap(page_table_t *source) {
           }
 
           if (pt_entry & VMM_HUGE_PAGE) {
-            vmm_destroy_pagemap(clone);
-            return NULL;
+            goto clone_fail;
           }
 
           uint64_t virt =
               ((uint64_t)pml4_index << 39) | ((uint64_t)pdp_index << 30) |
               ((uint64_t)pd_index << 21) | ((uint64_t)pt_index << 12);
 
-          uint64_t phys_src = pt_entry & phys_mask;
+          uint64_t phys = pt_entry & phys_mask;
+          uint64_t flags = pt_entry & flags_mask;
 
-          void *phys_dst_ptr = pmm_alloc(1);
-          if (!phys_dst_ptr) {
-            vmm_destroy_pagemap(clone);
-            return NULL;
+          bool writable = (flags & VMM_WRITABLE) != 0;
+          bool cow = (flags & VMM_COW) != 0;
+          uint64_t map_flags = flags;
+
+          if (writable && !cow) {
+            if (!vmm_update_entry(source, virt, VMM_COW, VMM_WRITABLE)) {
+              goto clone_fail;
+            }
+
+            cow_patch_t *patch = kmalloc(sizeof(cow_patch_t));
+            if (!patch) {
+              vmm_update_entry(source, virt, VMM_WRITABLE, VMM_COW);
+              goto clone_fail;
+            }
+
+            patch->virt = virt;
+            patch->next = patches;
+            patches = patch;
+
+            map_flags = (flags | VMM_COW) & ~VMM_WRITABLE;
+          } else if (cow) {
+            map_flags = (flags | VMM_COW) & ~VMM_WRITABLE;
           }
 
-          uint64_t phys_dst = (uint64_t)phys_dst_ptr;
-          memcpy((void *)(phys_dst + hhdm_offset),
-                 (void *)(phys_src + hhdm_offset), PAGE_SIZE);
-
-          uint64_t flags = (pt_entry & flags_mask) | VMM_PRESENT;
-
-          if (!vmm_map_page(clone, virt, phys_dst, flags)) {
-            pmm_free(phys_dst_ptr, 1);
-            vmm_destroy_pagemap(clone);
-            return NULL;
+          if (!vmm_map_page(clone, virt, phys, map_flags)) {
+            goto clone_fail;
           }
+
+          pmm_ref_inc(phys);
         }
       }
     }
   }
 
+  while (patches) {
+    cow_patch_t *next = patches->next;
+    kfree(patches);
+    patches = next;
+  }
+
   return clone;
+
+clone_fail:
+  while (patches) {
+    vmm_update_entry(source, patches->virt, VMM_WRITABLE, VMM_COW);
+    cow_patch_t *next = patches->next;
+    kfree(patches);
+    patches = next;
+  }
+
+  vmm_destroy_pagemap(clone);
+  return NULL;
 }
 
 void vmm_switch_pagemap(page_table_t *pagemap) {
@@ -237,82 +297,65 @@ void vmm_switch_pagemap(page_table_t *pagemap) {
 
 bool vmm_map_page(page_table_t *pagemap, uint64_t virt, uint64_t phys,
                   uint64_t flags) {
-  size_t pml4_index = PML4_GET_INDEX(virt);
-  size_t pdp_index = PDP_GET_INDEX(virt);
-  size_t pd_index = PD_GET_INDEX(virt);
-  size_t pt_index = PT_GET_INDEX(virt);
-
-  uint64_t *pdp = get_next_level(pagemap->pml4, pml4_index, true, flags);
-  if (pdp == NULL)
+  uint64_t *pte = get_pte_ptr(pagemap, virt, true, flags);
+  if (pte == NULL) {
     return false;
+  }
 
-  uint64_t *pd = get_next_level(pdp, pdp_index, true, flags);
-  if (pd == NULL)
-    return false;
-
-  uint64_t *pt = get_next_level(pd, pd_index, true, flags);
-  if (pt == NULL)
-    return false;
-
-  pt[pt_index] = phys | flags | VMM_PRESENT;
-
-  asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
-
+  *pte = phys | flags | VMM_PRESENT;
+  vmm_invalidate(virt);
   return true;
 }
 
 bool vmm_unmap_page(page_table_t *pagemap, uint64_t virt) {
-  size_t pml4_index = PML4_GET_INDEX(virt);
-  size_t pdp_index = PDP_GET_INDEX(virt);
-  size_t pd_index = PD_GET_INDEX(virt);
-  size_t pt_index = PT_GET_INDEX(virt);
-
-  uint64_t *pdp = get_next_level(pagemap->pml4, pml4_index, false, 0);
-  if (pdp == NULL)
-    return false;
-
-  uint64_t *pd = get_next_level(pdp, pdp_index, false, 0);
-  if (pd == NULL)
-    return false;
-
-  uint64_t *pt = get_next_level(pd, pd_index, false, 0);
-  if (pt == NULL)
-    return false;
-
-  if (!(pt[pt_index] & VMM_PRESENT)) {
+  uint64_t *pte = get_pte_ptr(pagemap, virt, false, 0);
+  if (pte == NULL || !(*pte & VMM_PRESENT)) {
     return false;
   }
 
-  pt[pt_index] = 0;
-
-  asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
-
+  *pte = 0;
+  vmm_invalidate(virt);
   return true;
 }
 
 uint64_t vmm_get_phys(page_table_t *pagemap, uint64_t virt) {
-  size_t pml4_index = PML4_GET_INDEX(virt);
-  size_t pdp_index = PDP_GET_INDEX(virt);
-  size_t pd_index = PD_GET_INDEX(virt);
-  size_t pt_index = PT_GET_INDEX(virt);
-
-  uint64_t *pdp = get_next_level(pagemap->pml4, pml4_index, false, 0);
-  if (pdp == NULL)
-    return 0;
-
-  uint64_t *pd = get_next_level(pdp, pdp_index, false, 0);
-  if (pd == NULL)
-    return 0;
-
-  uint64_t *pt = get_next_level(pd, pd_index, false, 0);
-  if (pt == NULL)
-    return 0;
-
-  if (!(pt[pt_index] & VMM_PRESENT)) {
+  uint64_t *pte = get_pte_ptr(pagemap, virt, false, 0);
+  if (pte == NULL || !(*pte & VMM_PRESENT)) {
     return 0;
   }
 
-  return pt[pt_index] & 0x000FFFFFFFFFF000;
+  return *pte & 0x000FFFFFFFFFF000ULL;
 }
 
 page_table_t *vmm_get_kernel_pagemap(void) { return &kernel_pagemap; }
+
+bool vmm_get_entry(page_table_t *pagemap, uint64_t virt, uint64_t *entry_out) {
+  uint64_t *pte = get_pte_ptr(pagemap, virt, false, 0);
+  if (pte == NULL || !(*pte & VMM_PRESENT)) {
+    return false;
+  }
+
+  if (entry_out) {
+    *entry_out = *pte;
+  }
+  return true;
+}
+
+bool vmm_update_entry(page_table_t *pagemap, uint64_t virt, uint64_t set_flags,
+                      uint64_t clear_flags) {
+  uint64_t *pte = get_pte_ptr(pagemap, virt, false, 0);
+  if (pte == NULL || !(*pte & VMM_PRESENT)) {
+    return false;
+  }
+
+  uint64_t entry = *pte;
+  entry |= set_flags;
+  entry &= ~clear_flags;
+  *pte = entry;
+  vmm_invalidate(virt);
+  return true;
+}
+
+void vmm_invalidate(uint64_t virt) {
+  asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
+}

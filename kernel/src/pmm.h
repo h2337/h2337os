@@ -15,5 +15,8 @@ size_t pmm_get_total_pages(void);
 size_t pmm_get_used_pages(void);
 void pmm_mark_used(uint64_t phys_addr);
 void pmm_mark_used_range(uint64_t phys_addr, size_t length);
+uint32_t pmm_ref_inc(uint64_t phys_addr);
+uint32_t pmm_ref_dec(uint64_t phys_addr);
+uint32_t pmm_ref_get(uint64_t phys_addr);
 
 #endif

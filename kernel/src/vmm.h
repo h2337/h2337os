@@ -14,6 +14,7 @@
 #define VMM_DIRTY (1ULL << 6)
 #define VMM_HUGE_PAGE (1ULL << 7)
 #define VMM_GLOBAL (1ULL << 8)
+#define VMM_COW (1ULL << 9)
 #define VMM_NO_EXECUTE (1ULL << 63)
 
 #define PML4_GET_INDEX(addr) (((addr) >> 39) & 0x1FF)
@@ -35,5 +36,9 @@ bool vmm_map_page(page_table_t *pagemap, uint64_t virt, uint64_t phys,
 bool vmm_unmap_page(page_table_t *pagemap, uint64_t virt);
 uint64_t vmm_get_phys(page_table_t *pagemap, uint64_t virt);
 page_table_t *vmm_get_kernel_pagemap(void);
+bool vmm_get_entry(page_table_t *pagemap, uint64_t virt, uint64_t *entry_out);
+bool vmm_update_entry(page_table_t *pagemap, uint64_t virt, uint64_t set_flags,
+                      uint64_t clear_flags);
+void vmm_invalidate(uint64_t virt);
 
 #endif

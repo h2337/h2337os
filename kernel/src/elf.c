@@ -363,6 +363,8 @@ int elf_exec(const char *path, char *const argv[], char *const envp[]) {
   current->pagemap = new_pagemap;
   current->owns_pagemap = true;
 
+  process_vm_clear_regions(current);
+
   process_ensure_standard_streams(current);
 
   strncpy(current->name, path, 63);

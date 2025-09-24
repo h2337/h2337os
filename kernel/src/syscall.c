@@ -5,6 +5,7 @@
 #include "idt.h"
 #include "libc.h"
 #include "pipe.h"
+#include "pmm.h"
 #include "process.h"
 #include "tty.h"
 #include "types.h"
@@ -13,6 +14,14 @@
 #include <stddef.h>
 
 extern void syscall_entry(void);
+
+#define PROT_READ 0x1
+#define PROT_WRITE 0x2
+#define PROT_EXEC 0x4
+
+#define MAP_PRIVATE 0x02
+#define MAP_FIXED 0x10
+#define MAP_ANONYMOUS 0x20
 
 static uint64_t sys_exit(int exit_code) {
   kprint("Process exiting with code: ");
@@ -175,26 +184,89 @@ static uint64_t sys_brk(void *addr) {
 
 static uint64_t sys_mmap(void *addr, size_t length, int prot, int flags, int fd,
                          off_t offset) {
-  (void)addr;
-  (void)prot;
-  (void)flags;
   (void)fd;
   (void)offset;
 
-  if (length == 0)
-    return -1;
+  process_t *proc = process_get_current();
+  if (!proc || !proc->pagemap || length == 0) {
+    return (uint64_t)-1;
+  }
 
-  void *ptr = kmalloc(length);
-  if (!ptr)
-    return -1;
+  if ((prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) == 0) {
+    return (uint64_t)-1;
+  }
 
-  memset(ptr, 0, length);
-  return (uint64_t)ptr;
+  if (!(flags & MAP_ANONYMOUS)) {
+    return (uint64_t)-1;
+  }
+
+  uint64_t aligned_length = (length + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+  if (aligned_length == 0) {
+    aligned_length = PAGE_SIZE;
+  }
+
+  uint64_t start = 0;
+  uint64_t original_base = proc->mmap_base;
+
+  if (flags & MAP_FIXED) {
+    if (!addr || ((uint64_t)addr & (PAGE_SIZE - 1)) != 0) {
+      return (uint64_t)-1;
+    }
+    start = (uint64_t)addr;
+  } else {
+    start = process_vm_reserve_addr(proc, aligned_length);
+    if (start == 0) {
+      return (uint64_t)-1;
+    }
+  }
+
+  uint64_t vmm_flags = VMM_USER;
+  if (prot & PROT_WRITE) {
+    vmm_flags |= VMM_WRITABLE;
+  }
+  if (!(prot & PROT_EXEC)) {
+    vmm_flags |= VMM_NO_EXECUTE;
+  }
+
+  vm_region_t *region =
+      process_vm_add_region(proc, start, aligned_length, prot, flags, fd, offset);
+  if (!region) {
+    if (!(flags & MAP_FIXED)) {
+      proc->mmap_base = original_base;
+    }
+    return (uint64_t)-1;
+  }
+
+  region->flags = vmm_flags;
+
+  return start;
 }
 
 static uint64_t sys_munmap(void *addr, size_t length) {
-  (void)length;
-  kfree(addr);
+  process_t *proc = process_get_current();
+  if (!proc || !addr || length == 0) {
+    return (uint64_t)-1;
+  }
+
+  uint64_t start = (uint64_t)addr;
+  uint64_t aligned_start = start & ~(uint64_t)(PAGE_SIZE - 1);
+  uint64_t aligned_length = (length + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+  if (aligned_length == 0) {
+    aligned_length = PAGE_SIZE;
+  }
+
+  vm_region_t *region = process_vm_find_region(proc, aligned_start);
+  if (!region) {
+    return (uint64_t)-1;
+  }
+
+  uint64_t region_length = region->end - region->start;
+  if (aligned_start != region->start || aligned_length != region_length) {
+    return (uint64_t)-1;
+  }
+
+  process_vm_unmap_range(proc, region->start, region_length);
+  process_vm_remove_region(proc, region->start, region_length);
   return 0;
 }
 
