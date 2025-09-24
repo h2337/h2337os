@@ -13,6 +13,14 @@
 #define DEFAULT_TIME_SLICE 10
 #define MAX_PATH_LENGTH 256
 
+#define PROCESS_PRIORITY_HIGH 0
+#define PROCESS_PRIORITY_NORMAL 1
+#define PROCESS_PRIORITY_LOW 2
+#define PROCESS_PRIORITY_COUNT 3
+#define PROCESS_PRIORITY_DEFAULT PROCESS_PRIORITY_NORMAL
+
+#define PROCESS_AFFINITY_ALL 0xFFFFFFFFu
+
 typedef enum {
   PROCESS_STATE_READY,
   PROCESS_STATE_RUNNING,
@@ -68,6 +76,12 @@ typedef struct process {
   uint64_t ticks_remaining;
   uint64_t total_ticks;
   uint64_t sleep_until_tick;
+  int priority;
+  uint32_t affinity_mask;
+  uint32_t last_cpu;
+  struct process *run_next;
+  struct process *run_prev;
+  bool on_run_queue;
 
   void *brk;
   void *brk_start;
@@ -121,5 +135,7 @@ void scheduler_tick(void);
 void schedule(void);
 void context_switch(context_t *old, context_t *new);
 int scheduler_is_enabled(void);
+void process_set_priority(process_t *proc, int priority);
+void process_set_affinity(process_t *proc, uint32_t affinity_mask);
 
 #endif

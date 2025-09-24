@@ -26,6 +26,259 @@ static spinlock_t process_list_lock = SPINLOCK_INIT("process_list");
 static spinlock_t pid_counter_lock = SPINLOCK_INIT("pid_counter");
 static spinlock_t scheduler_lock = SPINLOCK_INIT("scheduler");
 
+typedef struct run_queue {
+  spinlock_t lock;
+  process_t *heads[PROCESS_PRIORITY_COUNT];
+  process_t *tails[PROCESS_PRIORITY_COUNT];
+  size_t load;
+} run_queue_t;
+
+static run_queue_t cpu_run_queues[SMP_MAX_CPUS];
+
+#define SCHEDULER_BALANCE_INTERVAL 64
+
+static inline bool is_idle_process(process_t *process);
+static inline bool scheduler_cpu_online(uint32_t cpu_id);
+static inline uint32_t current_cpu_index(void);
+
+static inline int clamp_priority(int priority) {
+  if (priority < PROCESS_PRIORITY_HIGH) {
+    return PROCESS_PRIORITY_HIGH;
+  }
+  if (priority > PROCESS_PRIORITY_LOW) {
+    return PROCESS_PRIORITY_LOW;
+  }
+  return priority;
+}
+
+static inline uint64_t priority_time_slice(int priority) {
+  priority = clamp_priority(priority);
+  switch (priority) {
+  case PROCESS_PRIORITY_HIGH: {
+    uint64_t slice = DEFAULT_TIME_SLICE / 2;
+    return slice > 0 ? slice : 1;
+  }
+  case PROCESS_PRIORITY_LOW:
+    return DEFAULT_TIME_SLICE * 2;
+  default:
+    return DEFAULT_TIME_SLICE;
+  }
+}
+
+static inline bool process_has_affinity(process_t *proc, uint32_t cpu_id) {
+  if (!proc) {
+    return false;
+  }
+  if (proc->affinity_mask == PROCESS_AFFINITY_ALL) {
+    return true;
+  }
+  if (cpu_id >= 32) {
+    return false;
+  }
+  return (proc->affinity_mask & (1u << cpu_id)) != 0;
+}
+
+static inline bool scheduler_cpu_online(uint32_t cpu_id) {
+  cpu_local_t *local = smp_get_cpu_local_by_index(cpu_id);
+  return local && local->online;
+}
+
+static void run_queue_init(run_queue_t *rq) {
+  spinlock_init(&rq->lock, "run_queue");
+  memset(rq->heads, 0, sizeof(rq->heads));
+  memset(rq->tails, 0, sizeof(rq->tails));
+  rq->load = 0;
+}
+
+static void run_queue_insert_locked(run_queue_t *rq, process_t *proc,
+                                    bool front) {
+  int priority = clamp_priority(proc->priority);
+  if (proc->on_run_queue) {
+    return;
+  }
+
+  process_t **head = &rq->heads[priority];
+  process_t **tail = &rq->tails[priority];
+
+  proc->run_next = NULL;
+  proc->run_prev = NULL;
+
+  if (front) {
+    if (*head) {
+      proc->run_next = *head;
+      (*head)->run_prev = proc;
+    } else {
+      *tail = proc;
+    }
+    *head = proc;
+  } else {
+    if (*tail) {
+      (*tail)->run_next = proc;
+      proc->run_prev = *tail;
+    } else {
+      *head = proc;
+    }
+    *tail = proc;
+  }
+
+  proc->on_run_queue = true;
+  rq->load++;
+}
+
+static void run_queue_remove_locked(run_queue_t *rq, process_t *proc) {
+  if (!proc || !proc->on_run_queue) {
+    return;
+  }
+
+  int priority = clamp_priority(proc->priority);
+  process_t **head = &rq->heads[priority];
+  process_t **tail = &rq->tails[priority];
+
+  if (proc->run_prev) {
+    proc->run_prev->run_next = proc->run_next;
+  }
+  if (proc->run_next) {
+    proc->run_next->run_prev = proc->run_prev;
+  }
+  if (*head == proc) {
+    *head = proc->run_next;
+  }
+  if (*tail == proc) {
+    *tail = proc->run_prev;
+  }
+
+  proc->run_next = NULL;
+  proc->run_prev = NULL;
+  proc->on_run_queue = false;
+  if (rq->load > 0) {
+    rq->load--;
+  }
+}
+
+static process_t *run_queue_select_locked(run_queue_t *rq) {
+  for (int prio = PROCESS_PRIORITY_HIGH; prio <= PROCESS_PRIORITY_LOW; ++prio) {
+    process_t *node = rq->heads[prio];
+    while (node && node->state != PROCESS_STATE_READY) {
+      // Skip stale entries that might still be marked ready elsewhere
+      process_t *next = node->run_next;
+      run_queue_remove_locked(rq, node);
+      node = next;
+    }
+    if (node) {
+      run_queue_remove_locked(rq, node);
+      return node;
+    }
+  }
+  return NULL;
+}
+
+static process_t *run_queue_steal_locked(run_queue_t *rq, uint32_t target_cpu) {
+  for (int prio = PROCESS_PRIORITY_LOW; prio >= PROCESS_PRIORITY_HIGH; --prio) {
+    process_t *node = rq->tails[prio];
+    while (node) {
+      process_t *prev = node->run_prev;
+      if (node->state == PROCESS_STATE_READY &&
+          process_has_affinity(node, target_cpu)) {
+        run_queue_remove_locked(rq, node);
+        return node;
+      }
+      node = prev;
+    }
+  }
+  return NULL;
+}
+
+static void scheduler_trigger_balance(uint32_t cpu_id);
+
+static uint32_t scheduler_select_cpu(process_t *proc, uint32_t preferred_cpu) {
+  uint32_t cpu_count = smp_get_cpu_count();
+  if (cpu_count == 0) {
+    cpu_count = 1;
+  }
+  if (cpu_count > SMP_MAX_CPUS) {
+    cpu_count = SMP_MAX_CPUS;
+  }
+
+  if (preferred_cpu < cpu_count && scheduler_cpu_online(preferred_cpu) &&
+      process_has_affinity(proc, preferred_cpu)) {
+    return preferred_cpu;
+  }
+
+  uint32_t best_cpu = SMP_MAX_CPUS;
+  size_t best_load = (size_t)-1;
+
+  for (uint32_t cpu = 0; cpu < cpu_count; ++cpu) {
+    if (!scheduler_cpu_online(cpu) || !process_has_affinity(proc, cpu)) {
+      continue;
+    }
+
+    size_t load = __atomic_load_n(&cpu_run_queues[cpu].load, __ATOMIC_RELAXED);
+    if (best_cpu == SMP_MAX_CPUS || load < best_load ||
+        (load == best_load && cpu == preferred_cpu)) {
+      best_cpu = cpu;
+      best_load = load;
+    }
+  }
+
+  if (best_cpu != SMP_MAX_CPUS) {
+    return best_cpu;
+  }
+
+  uint32_t current_cpu = current_cpu_index();
+  if (scheduler_cpu_online(current_cpu) &&
+      process_has_affinity(proc, current_cpu)) {
+    return current_cpu;
+  }
+
+  return 0;
+}
+
+static void scheduler_enqueue_process(process_t *proc, uint32_t preferred_cpu,
+                                      bool front) {
+  if (!proc || is_idle_process(proc)) {
+    return;
+  }
+
+  uint32_t target_cpu = scheduler_select_cpu(proc, preferred_cpu);
+  if (target_cpu >= SMP_MAX_CPUS) {
+    target_cpu = target_cpu % SMP_MAX_CPUS;
+  }
+
+  if (!scheduler_cpu_online(target_cpu) ||
+      !process_has_affinity(proc, target_cpu)) {
+    uint32_t fallback = current_cpu_index();
+    if (!scheduler_cpu_online(fallback) ||
+        !process_has_affinity(proc, fallback)) {
+      fallback = 0;
+    }
+    target_cpu = fallback % SMP_MAX_CPUS;
+  }
+
+  run_queue_t *rq = &cpu_run_queues[target_cpu];
+  irq_state_t flags = spin_lock_irqsave(&rq->lock);
+  proc->last_cpu = target_cpu;
+  proc->time_slice = priority_time_slice(proc->priority);
+  proc->ticks_remaining = proc->time_slice;
+  run_queue_insert_locked(rq, proc, front);
+  spin_unlock_irqrestore(&rq->lock, flags);
+}
+
+static void scheduler_remove_from_queue(process_t *proc) {
+  if (!proc || !proc->on_run_queue) {
+    return;
+  }
+
+  uint32_t cpu = proc->last_cpu;
+  if (cpu >= SMP_MAX_CPUS) {
+    cpu = cpu % SMP_MAX_CPUS;
+  }
+
+  run_queue_t *rq = &cpu_run_queues[cpu];
+  irq_state_t flags = spin_lock_irqsave(&rq->lock);
+  run_queue_remove_locked(rq, proc);
+  spin_unlock_irqrestore(&rq->lock, flags);
+}
+
 extern void context_switch(context_t *old, context_t *new);
 
 static void idle_task(void) {
@@ -40,15 +293,6 @@ static inline bool is_idle_process(process_t *process) {
   for (uint32_t i = 0; i < SMP_MAX_CPUS; i++) {
     if (idle_processes[i] == process) {
       return true;
-    }
-  }
-  return false;
-}
-
-static inline bool is_idle_for_other_cpu(process_t *process, uint32_t cpu_id) {
-  for (uint32_t i = 0; i < SMP_MAX_CPUS; i++) {
-    if (idle_processes[i] == process) {
-      return i != cpu_id;
     }
   }
   return false;
@@ -268,8 +512,11 @@ static process_t *create_idle_process(uint32_t cpu_id) {
   strcpy(idle->name, "idle");
   strcpy(idle->cwd, "/");
   idle->state = PROCESS_STATE_READY;
-  idle->time_slice = DEFAULT_TIME_SLICE;
-  idle->ticks_remaining = DEFAULT_TIME_SLICE;
+  idle->priority = PROCESS_PRIORITY_LOW;
+  idle->affinity_mask = (cpu_id < 32) ? (1u << cpu_id) : PROCESS_AFFINITY_ALL;
+  idle->last_cpu = cpu_id;
+  idle->time_slice = priority_time_slice(idle->priority);
+  idle->ticks_remaining = idle->time_slice;
   idle->sleep_until_tick = 0;
   idle->stack_size = KERNEL_STACK_SIZE;
   idle->stack = kmalloc(KERNEL_STACK_SIZE);
@@ -320,6 +567,9 @@ void process_init(void) {
 
   memset(current_processes, 0, sizeof(current_processes));
   memset(idle_processes, 0, sizeof(idle_processes));
+  for (uint32_t i = 0; i < SMP_MAX_CPUS; ++i) {
+    run_queue_init(&cpu_run_queues[i]);
+  }
 
   process_t *idle0 = create_idle_process(0);
   if (!idle0) {
@@ -375,8 +625,11 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
     strcpy(process->cwd, "/");
   }
   process->state = PROCESS_STATE_READY;
-  process->time_slice = DEFAULT_TIME_SLICE;
-  process->ticks_remaining = DEFAULT_TIME_SLICE;
+  process->priority = PROCESS_PRIORITY_DEFAULT;
+  process->affinity_mask = PROCESS_AFFINITY_ALL;
+  process->last_cpu = current_cpu_index();
+  process->time_slice = priority_time_slice(process->priority);
+  process->ticks_remaining = process->time_slice;
   process->sleep_until_tick = 0;
 
   for (int i = 0; i < 256; i++) {
@@ -435,6 +688,7 @@ process_t *process_create(const char *name, void (*entry_point)(void)) {
   kprint("\n");
 
   if (scheduler_enabled) {
+    scheduler_enqueue_process(process, process->last_cpu, false);
     schedule();
   }
 
@@ -473,6 +727,8 @@ void process_destroy(process_t *process) {
   process_count--;
   spin_unlock(&process_list_lock);
 
+  scheduler_remove_from_queue(process);
+
   process_vm_clear_regions(process);
 
   if (process->stack) {
@@ -496,6 +752,9 @@ void process_exit(int exit_code) {
 
     if (proc->parent && proc->parent->state == PROCESS_STATE_BLOCKED) {
       proc->parent->state = PROCESS_STATE_READY;
+      if (scheduler_enabled && !is_idle_process(proc->parent)) {
+        scheduler_enqueue_process(proc->parent, proc->parent->last_cpu, true);
+      }
     }
 
     process_t *fallback_idle = idle_processes[0];
@@ -548,6 +807,9 @@ void process_wake(process_t *process) {
     process->state = PROCESS_STATE_READY;
     process->ticks_remaining = process->time_slice;
     process->sleep_until_tick = 0;
+    if (scheduler_enabled) {
+      scheduler_enqueue_process(process, process->last_cpu, false);
+    }
   }
 }
 
@@ -640,84 +902,117 @@ void scheduler_tick(void) {
 
   current->total_ticks++;
 
+  process_t *to_wake[MAX_PROCESSES];
+  size_t wake_count = 0;
+
   uint64_t current_ticks = pit_get_ticks();
+
+  spin_lock(&process_list_lock);
   process_t *p = process_list_head;
   while (p) {
     if (p->state == PROCESS_STATE_BLOCKED) {
+      bool should_wake = false;
       if (p->sleep_until_tick != 0) {
         if ((int64_t)(current_ticks - p->sleep_until_tick) >= 0) {
-          process_wake(p);
+          should_wake = true;
         }
       } else if (p->ticks_remaining > 0) {
         p->ticks_remaining--;
         if (p->ticks_remaining == 0) {
-          process_wake(p);
+          should_wake = true;
         }
+      }
+
+      if (should_wake && wake_count < MAX_PROCESSES) {
+        p->sleep_until_tick = 0;
+        p->ticks_remaining = p->time_slice;
+        p->state = PROCESS_STATE_READY;
+        to_wake[wake_count++] = p;
       }
     }
     p = p->next;
   }
+  spin_unlock(&process_list_lock);
 
-  if (current->state == PROCESS_STATE_RUNNING) {
-    current->ticks_remaining--;
+  for (size_t i = 0; i < wake_count; ++i) {
+    if (!is_idle_process(to_wake[i])) {
+      scheduler_enqueue_process(to_wake[i], to_wake[i]->last_cpu, false);
+    }
+  }
+
+  uint32_t cpu_id = current_cpu_index();
+  run_queue_t *rq = &cpu_run_queues[cpu_id % SMP_MAX_CPUS];
+
+  if (!is_idle_process(current)) {
+    if (current->ticks_remaining > 0) {
+      current->ticks_remaining--;
+    }
     if (current->ticks_remaining == 0) {
       schedule();
     }
+  } else {
+    if (__atomic_load_n(&rq->load, __ATOMIC_RELAXED) > 0) {
+      schedule();
+    }
+  }
+
+  cpu_local_t *cpu = smp_get_cpu_local();
+  if (cpu && (cpu->scheduler_ticks % SCHEDULER_BALANCE_INTERVAL) == 0) {
+    scheduler_trigger_balance(cpu->cpu_id);
   }
 }
 
 void schedule(void) {
-  if (!scheduler_enabled || !process_list_head) {
+  if (!scheduler_enabled) {
     return;
   }
 
   uint32_t cpu_id = current_cpu_index();
-  irq_state_t flags = spin_lock_irqsave(&scheduler_lock);
-  spin_lock(&process_list_lock);
-
   process_t *old_process = get_current_process_local();
-  process_t *next_process = NULL;
+  run_queue_t *rq = &cpu_run_queues[cpu_id];
 
-  if (old_process && old_process->state == PROCESS_STATE_RUNNING) {
+  irq_state_t flags = spin_lock_irqsave(&rq->lock);
+
+  process_t *migrate_process = NULL;
+  if (old_process && old_process->state == PROCESS_STATE_RUNNING &&
+      !is_idle_process(old_process)) {
     old_process->state = PROCESS_STATE_READY;
+    old_process->time_slice = priority_time_slice(old_process->priority);
+    old_process->ticks_remaining = old_process->time_slice;
+    if (process_has_affinity(old_process, cpu_id)) {
+      old_process->last_cpu = cpu_id;
+      run_queue_insert_locked(rq, old_process, false);
+    } else {
+      migrate_process = old_process;
+    }
   }
 
-  process_t *start = old_process ? old_process->next : process_list_head;
-  if (!start) {
-    start = process_list_head;
-  }
+  process_t *next_process = run_queue_select_locked(rq);
+  spin_unlock_irqrestore(&rq->lock, flags);
 
-  process_t *p = start;
-  while (p) {
-    if (p->state == PROCESS_STATE_READY && !is_idle_for_other_cpu(p, cpu_id)) {
-      next_process = p;
-      break;
-    }
-    p = p->next ? p->next : process_list_head;
-    if (p == start) {
-      break;
-    }
+  if (migrate_process) {
+    scheduler_enqueue_process(migrate_process, cpu_id, false);
   }
 
   if (!next_process) {
     next_process =
         idle_processes[cpu_id] ? idle_processes[cpu_id] : idle_processes[0];
+    if (!next_process) {
+      return;
+    }
+  }
+
+  if (old_process && old_process != next_process &&
+      is_idle_process(old_process)) {
+    old_process->state = PROCESS_STATE_READY;
   }
 
   if (old_process == next_process) {
-    if (old_process) {
-      old_process->state = PROCESS_STATE_RUNNING;
-      old_process->ticks_remaining = old_process->time_slice;
-    }
-    spin_unlock(&process_list_lock);
-    spin_unlock_irqrestore(&scheduler_lock, flags);
-    return;
-  }
-
-  if (next_process) {
     next_process->state = PROCESS_STATE_RUNNING;
+    next_process->last_cpu = cpu_id;
     next_process->ticks_remaining = next_process->time_slice;
     set_current_process_local(next_process);
+    return;
   }
 
   page_table_t *old_map = (old_process && old_process->pagemap)
@@ -727,18 +1022,116 @@ void schedule(void) {
                               ? next_process->pagemap
                               : vmm_get_kernel_pagemap();
 
-  spin_unlock(&process_list_lock);
+  next_process->state = PROCESS_STATE_RUNNING;
+  next_process->last_cpu = cpu_id;
+  next_process->ticks_remaining = next_process->time_slice;
+  set_current_process_local(next_process);
 
   if (new_map && new_map != old_map) {
     vmm_switch_pagemap(new_map);
   }
 
-  spin_unlock_irqrestore(&scheduler_lock, flags);
-
   if (old_process && next_process) {
     context_switch(&old_process->context, &next_process->context);
   } else if (next_process) {
     context_switch(NULL, &next_process->context);
+  }
+}
+
+static void scheduler_trigger_balance(uint32_t cpu_id) {
+  uint32_t cpu_count = smp_get_cpu_count();
+  if (cpu_count == 0) {
+    cpu_count = 1;
+  }
+  if (cpu_count > SMP_MAX_CPUS) {
+    cpu_count = SMP_MAX_CPUS;
+  }
+
+  if (!scheduler_cpu_online(cpu_id)) {
+    return;
+  }
+
+  if (cpu_count <= 1) {
+    return;
+  }
+
+  irq_state_t sched_flags = spin_lock_irqsave(&scheduler_lock);
+
+  size_t loads[SMP_MAX_CPUS] = {0};
+  for (uint32_t i = 0; i < cpu_count; ++i) {
+    if (!scheduler_cpu_online(i)) {
+      loads[i] = 0;
+      continue;
+    }
+    loads[i] = __atomic_load_n(&cpu_run_queues[i].load, __ATOMIC_RELAXED);
+  }
+
+  bool migrated = false;
+
+  while (!migrated) {
+    uint32_t busiest_cpu = cpu_id;
+    size_t busiest_load = loads[busiest_cpu];
+
+    for (uint32_t i = 0; i < cpu_count; ++i) {
+      if (!scheduler_cpu_online(i)) {
+        continue;
+      }
+      if (loads[i] > busiest_load) {
+        busiest_cpu = i;
+        busiest_load = loads[i];
+      }
+    }
+
+    size_t target_load = loads[cpu_id];
+    if (busiest_cpu == cpu_id || busiest_load <= target_load + 1) {
+      break;
+    }
+
+    run_queue_t *source = &cpu_run_queues[busiest_cpu];
+    run_queue_t *target = &cpu_run_queues[cpu_id];
+
+    if (busiest_cpu == cpu_id) {
+      break;
+    }
+
+    if (busiest_cpu < cpu_id) {
+      spin_lock(&source->lock);
+      spin_lock(&target->lock);
+    } else {
+      spin_lock(&target->lock);
+      if (source != target) {
+        spin_lock(&source->lock);
+      }
+    }
+
+    process_t *migrated_proc = run_queue_steal_locked(source, cpu_id);
+    if (migrated_proc) {
+      migrated_proc->time_slice = priority_time_slice(migrated_proc->priority);
+      migrated_proc->ticks_remaining = migrated_proc->time_slice;
+      migrated_proc->last_cpu = cpu_id;
+      run_queue_insert_locked(target, migrated_proc, false);
+      migrated = true;
+    }
+
+    if (busiest_cpu < cpu_id) {
+      spin_unlock(&target->lock);
+      spin_unlock(&source->lock);
+    } else {
+      if (source != target) {
+        spin_unlock(&source->lock);
+      }
+      spin_unlock(&target->lock);
+    }
+
+    if (!migrated) {
+      loads[busiest_cpu] = target_load;
+    }
+  }
+
+  spin_unlock_irqrestore(&scheduler_lock, sched_flags);
+
+  if (migrated && is_idle_process(get_current_process_local())) {
+    schedule();
   }
 }
 
@@ -794,6 +1187,9 @@ process_t *process_fork(void) {
 
   memcpy(child, parent, sizeof(process_t));
   child->vm_regions = NULL;
+  child->run_next = NULL;
+  child->run_prev = NULL;
+  child->on_run_queue = false;
 
   child->stack = kmalloc(child->stack_size);
   if (!child->stack) {
@@ -815,7 +1211,11 @@ process_t *process_fork(void) {
   child->ppid = parent->pid;
   child->state = PROCESS_STATE_READY;
   child->total_ticks = 0;
-  child->ticks_remaining = DEFAULT_TIME_SLICE;
+  child->priority = clamp_priority(parent->priority);
+  child->affinity_mask = parent->affinity_mask;
+  child->last_cpu = parent->last_cpu;
+  child->time_slice = priority_time_slice(child->priority);
+  child->ticks_remaining = child->time_slice;
   child->children = NULL;
   child->sibling = NULL;
   child->next = NULL;
@@ -875,6 +1275,10 @@ process_t *process_fork(void) {
   process_count++;
   spin_unlock(&process_list_lock);
 
+  if (scheduler_enabled) {
+    scheduler_enqueue_process(child, child->last_cpu, false);
+  }
+
   return child;
 }
 
@@ -932,6 +1336,87 @@ void process_ensure_standard_streams(process_t *proc) {
         proc->fd_table[fd] = vfs_fd;
       }
     }
+  }
+}
+
+void process_set_priority(process_t *proc, int priority) {
+  if (!proc || is_idle_process(proc)) {
+    return;
+  }
+
+  int old_priority = proc->priority;
+  int new_priority = clamp_priority(priority);
+  if (old_priority == new_priority) {
+    return;
+  }
+
+  uint64_t new_slice = priority_time_slice(new_priority);
+  uint32_t cpu = proc->last_cpu;
+  if (cpu >= SMP_MAX_CPUS) {
+    cpu = current_cpu_index();
+    if (cpu >= SMP_MAX_CPUS) {
+      cpu = 0;
+    }
+  }
+
+  if (proc->on_run_queue) {
+    run_queue_t *rq = &cpu_run_queues[cpu];
+    irq_state_t flags = spin_lock_irqsave(&rq->lock);
+    if (proc->on_run_queue) {
+      run_queue_remove_locked(rq, proc);
+    }
+    proc->priority = new_priority;
+    proc->time_slice = new_slice;
+    proc->ticks_remaining = proc->time_slice;
+    if (proc->state == PROCESS_STATE_READY) {
+      bool promote = new_priority < old_priority;
+      run_queue_insert_locked(rq, proc, promote);
+    }
+    spin_unlock_irqrestore(&rq->lock, flags);
+  } else {
+    proc->priority = new_priority;
+    proc->time_slice = new_slice;
+    if (proc->state == PROCESS_STATE_RUNNING ||
+        proc->state == PROCESS_STATE_READY) {
+      proc->ticks_remaining = proc->time_slice;
+    }
+  }
+}
+
+void process_set_affinity(process_t *proc, uint32_t affinity_mask) {
+  if (!proc || is_idle_process(proc)) {
+    return;
+  }
+
+  uint32_t new_mask = affinity_mask ? affinity_mask : PROCESS_AFFINITY_ALL;
+  if (proc->affinity_mask == new_mask) {
+    return;
+  }
+
+  proc->affinity_mask = new_mask;
+
+  if (proc->on_run_queue) {
+    uint32_t cpu = proc->last_cpu;
+    if (cpu >= SMP_MAX_CPUS) {
+      cpu = cpu % SMP_MAX_CPUS;
+    }
+    run_queue_t *rq = &cpu_run_queues[cpu];
+    irq_state_t flags = spin_lock_irqsave(&rq->lock);
+    if (proc->on_run_queue) {
+      run_queue_remove_locked(rq, proc);
+    }
+    spin_unlock_irqrestore(&rq->lock, flags);
+
+    if (scheduler_enabled && proc->state == PROCESS_STATE_READY) {
+      scheduler_enqueue_process(proc, cpu, false);
+    }
+  } else if (proc->state == PROCESS_STATE_READY && scheduler_enabled) {
+    scheduler_enqueue_process(proc, proc->last_cpu, false);
+  }
+
+  if (proc->state == PROCESS_STATE_RUNNING &&
+      !process_has_affinity(proc, current_cpu_index())) {
+    proc->ticks_remaining = 0;
   }
 }
 
