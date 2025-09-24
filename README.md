@@ -3,7 +3,7 @@
 A 64-bit monolithic hobby OS for x86_64, hand-rolled in C with Limine boot, FAT32 storage, multitasking, and a built-in shell.
 
 ## Core Moves
-- Memory: bitmap PMM, 4-level VMM split for kernel/user, and kmalloc/kfree/kcalloc/krealloc heap.
+- Memory: bitmap PMM, 4-level VMM split for kernel/user, and kmalloc/kfree/kcalloc/krealloc heap, demand-paging and CoW.
 - Processes: 256 slots, SMP, preemptive round-robin on PIT 100 Hz, states (Ready/Running/Blocked/Terminated/Zombie), fork/exec parenting, ELF64 (ET_EXEC/ET_DYN) loader, ring0↔ring3 hops, per-process FDs, cwd, and address space.
 - Storage: VFS layer, FAT32 with LFN, create/read/write/delete for files and dirs, RAM-backed root disk, multiple mount points.
 
