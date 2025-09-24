@@ -234,7 +234,7 @@ uint64_t elf_load(page_table_t *target_pagemap, const uint8_t *data,
 }
 
 int elf_exec(const char *path, char *const argv[], char *const envp[]) {
-  vfs_node_t *file = vfs_open(path, VFS_READ);
+  vfs_node_t *file = vfs_open(path, VFS_READ, 0);
   if (!file) {
     return -1;
   }

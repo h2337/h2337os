@@ -113,7 +113,8 @@ void fat32_open(vfs_node_t *node, uint32_t flags);
 void fat32_close(vfs_node_t *node);
 vfs_node_t *fat32_readdir(vfs_node_t *node, uint32_t index);
 vfs_node_t *fat32_finddir(vfs_node_t *node, const char *name);
-int fat32_create(vfs_node_t *parent, const char *name, uint32_t type);
+int fat32_create(vfs_node_t *parent, const char *name, uint32_t type,
+                 mode_t mode);
 int fat32_unlink(vfs_node_t *parent, const char *name);
 
 #endif

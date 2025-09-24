@@ -1,6 +1,7 @@
 #include "tty.h"
 #include "console.h"
 #include "heap.h"
+#include "ioctl.h"
 #include "libc.h"
 #include "process.h"
 #include "sync.h"
@@ -23,6 +24,8 @@ static spinlock_t tty_lock = SPINLOCK_INIT("tty");
 
 static vfs_node_t tty_node;
 static bool tty_device_registered = false;
+static unsigned short tty_rows = 25;
+static unsigned short tty_cols = 80;
 
 static bool enqueue_waiter(process_t *proc) {
   if (wait_count >= TTY_WAIT_QUEUE_CAPACITY) {
@@ -84,6 +87,10 @@ void tty_register_device(void) {
   strcpy(tty_node.name, "tty");
   tty_node.type = VFS_CHARDEVICE;
   tty_node.flags = VFS_READ | VFS_WRITE;
+  tty_node.mode =
+      S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+  tty_node.uid = 0;
+  tty_node.gid = 0;
   tty_node.read = tty_vfs_read;
   tty_node.write = tty_vfs_write;
   tty_node.open = tty_vfs_open;
@@ -189,4 +196,78 @@ void tty_handle_input(char c) {
   if (proc) {
     process_wake(proc);
   }
+}
+
+void tty_get_winsize(unsigned short *rows, unsigned short *cols) {
+  irq_state_t irq = spin_lock_irqsave(&tty_lock);
+  unsigned short current_rows = tty_rows;
+  unsigned short current_cols = tty_cols;
+  spin_unlock_irqrestore(&tty_lock, irq);
+
+  if (rows) {
+    *rows = current_rows;
+  }
+  if (cols) {
+    *cols = current_cols;
+  }
+}
+
+void tty_set_winsize(unsigned short rows, unsigned short cols) {
+  if (rows == 0) {
+    rows = 1;
+  }
+  if (cols == 0) {
+    cols = 1;
+  }
+
+  irq_state_t irq = spin_lock_irqsave(&tty_lock);
+  tty_rows = rows;
+  tty_cols = cols;
+  spin_unlock_irqrestore(&tty_lock, irq);
+}
+
+size_t tty_bytes_available(void) {
+  irq_state_t irq = spin_lock_irqsave(&tty_lock);
+  size_t available = tty_count;
+  spin_unlock_irqrestore(&tty_lock, irq);
+  return available;
+}
+
+int tty_ioctl(unsigned long request, void *arg) {
+  switch (request) {
+  case TIOCGWINSZ: {
+    if (!arg) {
+      return -1;
+    }
+    struct winsize *ws = (struct winsize *)arg;
+    unsigned short rows;
+    unsigned short cols;
+    tty_get_winsize(&rows, &cols);
+    ws->ws_row = rows;
+    ws->ws_col = cols;
+    ws->ws_xpixel = 0;
+    ws->ws_ypixel = 0;
+    return 0;
+  }
+  case TIOCSWINSZ: {
+    if (!arg) {
+      return -1;
+    }
+    struct winsize *ws = (struct winsize *)arg;
+    tty_set_winsize(ws->ws_row, ws->ws_col);
+    return 0;
+  }
+  case FIONREAD: {
+    if (!arg) {
+      return -1;
+    }
+    size_t available = tty_bytes_available();
+    *(int *)arg = (int)available;
+    return 0;
+  }
+  default:
+    break;
+  }
+
+  return -1;
 }

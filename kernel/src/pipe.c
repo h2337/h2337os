@@ -1,5 +1,6 @@
 #include "pipe.h"
 #include "heap.h"
+#include "ioctl.h"
 #include "libc.h"
 #include "process.h"
 #include "sync.h"
@@ -330,6 +331,10 @@ int pipe_create(int *read_fd, int *write_fd) {
   read_ep->node.type = VFS_PIPE;
   strcpy(read_ep->node.name, "pipe");
   read_ep->node.flags = VFS_READ;
+  read_ep->node.mode =
+      S_IFIFO | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+  read_ep->node.uid = 0;
+  read_ep->node.gid = 0;
   read_ep->node.read = pipe_vfs_read;
   read_ep->node.write = pipe_vfs_write;
   read_ep->node.open = pipe_vfs_open;
@@ -341,6 +346,10 @@ int pipe_create(int *read_fd, int *write_fd) {
   write_ep->node.type = VFS_PIPE;
   strcpy(write_ep->node.name, "pipe");
   write_ep->node.flags = VFS_WRITE;
+  write_ep->node.mode =
+      S_IFIFO | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+  write_ep->node.uid = 0;
+  write_ep->node.gid = 0;
   write_ep->node.read = pipe_vfs_read;
   write_ep->node.write = pipe_vfs_write;
   write_ep->node.open = pipe_vfs_open;
@@ -366,4 +375,31 @@ int pipe_create(int *read_fd, int *write_fd) {
   *read_fd = read_handle;
   *write_fd = write_handle;
   return 0;
+}
+
+int pipe_ioctl(vfs_node_t *node, unsigned long request, void *arg) {
+  pipe_endpoint_t *endpoint = endpoint_from_node(node);
+  if (!endpoint) {
+    return -1;
+  }
+
+  switch (request) {
+  case FIONREAD: {
+    if (!arg) {
+      return -1;
+    }
+    int available = 0;
+    if (!endpoint->is_write) {
+      irq_state_t irq = spin_lock_irqsave(&endpoint->pipe->lock);
+      available = (int)endpoint->pipe->count;
+      spin_unlock_irqrestore(&endpoint->pipe->lock, irq);
+    }
+    *(int *)arg = available;
+    return 0;
+  }
+  default:
+    break;
+  }
+
+  return -1;
 }

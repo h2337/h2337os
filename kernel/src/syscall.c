@@ -3,6 +3,7 @@
 #include "elf.h"
 #include "heap.h"
 #include "idt.h"
+#include "ioctl.h"
 #include "libc.h"
 #include "pipe.h"
 #include "pmm.h"
@@ -65,8 +66,6 @@ static uint64_t sys_read(int fd, char *buf, size_t count) {
 }
 
 static uint64_t sys_open(const char *path, int flags, int mode) {
-  (void)mode; // TODO: Implement mode support
-
   process_t *proc = process_get_current();
   if (!proc || !path)
     return -1;
@@ -96,7 +95,12 @@ static uint64_t sys_open(const char *path, int flags, int mode) {
   if (flags & 0x400)
     vfs_flags |= VFS_APPEND;
 
-  int vfs_fd = vfs_open_fd(path, vfs_flags);
+  mode_t mode_bits = 0;
+  if (mode >= 0) {
+    mode_bits = (mode_t)(mode & 0777);
+  }
+
+  int vfs_fd = vfs_open_fd(path, vfs_flags, mode_bits);
   if (vfs_fd < 0)
     return -1;
 
@@ -306,6 +310,43 @@ static uint64_t sys_chdir(const char *path) {
   return process_set_cwd(path);
 }
 
+static void fill_stat_from_node(const vfs_node_t *node, struct stat *statbuf) {
+  if (!node || !statbuf)
+    return;
+
+  memset(statbuf, 0, sizeof(struct stat));
+  statbuf->st_dev = 0;
+  statbuf->st_ino = node->inode;
+
+  mode_t mode = node->mode;
+  if (mode == 0) {
+    if (node->type & VFS_DIRECTORY) {
+      mode = S_IFDIR | S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP |
+             S_IROTH | S_IXOTH;
+    } else if (node->type & VFS_CHARDEVICE) {
+      mode =
+          S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+    } else if (node->type & VFS_PIPE) {
+      mode =
+          S_IFIFO | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+    } else {
+      mode = S_IFREG | S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+    }
+  }
+
+  statbuf->st_mode = mode;
+  statbuf->st_nlink = 1;
+  statbuf->st_uid = node->uid;
+  statbuf->st_gid = node->gid;
+  statbuf->st_rdev = 0;
+  statbuf->st_size = node->size;
+  statbuf->st_blksize = 512;
+  statbuf->st_blocks = (node->size + 511) / 512;
+  statbuf->st_atime = 0;
+  statbuf->st_mtime = 0;
+  statbuf->st_ctime = 0;
+}
+
 static uint64_t sys_stat(const char *path, struct stat *statbuf) {
   if (!path || !statbuf)
     return -1;
@@ -314,19 +355,7 @@ static uint64_t sys_stat(const char *path, struct stat *statbuf) {
   if (!node)
     return -1;
 
-  memset(statbuf, 0, sizeof(struct stat));
-  statbuf->st_ino = node->inode;
-  statbuf->st_mode = 0;
-  if (node->type & VFS_FILE)
-    statbuf->st_mode |= 0100000;
-  if (node->type & VFS_DIRECTORY)
-    statbuf->st_mode |= 0040000;
-  statbuf->st_uid = node->uid;
-  statbuf->st_gid = node->gid;
-  statbuf->st_size = node->size;
-  statbuf->st_blksize = 512;
-  statbuf->st_blocks = (node->size + 511) / 512;
-
+  fill_stat_from_node(node, statbuf);
   return 0;
 }
 
@@ -335,22 +364,19 @@ static uint64_t sys_fstat(int fd, struct stat *statbuf) {
   if (!proc || fd < 0 || fd >= 256 || !statbuf)
     return -1;
 
-  // Handle stdin/stdout/stderr
-  if (fd < 3) {
-    memset(statbuf, 0, sizeof(struct stat));
-    statbuf->st_mode = 0020000; // Character device
-    statbuf->st_blksize = 512;
-    return 0;
+  int vfs_fd = proc->fd_table[fd];
+  vfs_node_t *node = NULL;
+
+  if (vfs_fd >= 0) {
+    node = vfs_get_node_from_fd(vfs_fd);
+  } else if (fd >= 0 && fd < 3) {
+    node = vfs_resolve_path("/dev/tty");
   }
 
-  int vfs_fd = proc->fd_table[fd];
-  if (vfs_fd < 0)
+  if (!node)
     return -1;
 
-  // TODO: Get node from VFS fd and fill stat
-  memset(statbuf, 0, sizeof(struct stat));
-  statbuf->st_mode = 0100000; // Regular file for now
-  statbuf->st_blksize = 512;
+  fill_stat_from_node(node, statbuf);
   return 0;
 }
 
@@ -371,9 +397,46 @@ static uint64_t sys_lseek(int fd, off_t offset, int whence) {
 }
 
 static uint64_t sys_ioctl(int fd, unsigned long request, void *arg) {
-  (void)fd;
-  (void)request;
-  (void)arg;
+  process_t *proc = process_get_current();
+  if (!proc || fd < 0 || fd >= 256)
+    return -1;
+
+  int result = -1;
+
+  if (fd < 3) {
+    result = tty_ioctl(request, arg);
+    if (result != -1)
+      return result;
+  }
+
+  int vfs_fd = proc->fd_table[fd];
+  if (vfs_fd < 0)
+    return result;
+
+  vfs_node_t *node = vfs_get_node_from_fd(vfs_fd);
+  if (!node)
+    return -1;
+
+  if (node->type == VFS_CHARDEVICE) {
+    return tty_ioctl(request, arg);
+  }
+
+  if (node->type == VFS_PIPE) {
+    result = pipe_ioctl(node, request, arg);
+    if (result != -1)
+      return result;
+  }
+
+  switch (request) {
+  case FIONREAD:
+    if (!arg)
+      return -1;
+    *(int *)arg = 0;
+    return 0;
+  default:
+    break;
+  }
+
   return -1;
 }
 
@@ -465,8 +528,6 @@ static uint64_t sys_pipe(int pipefd[2]) {
 }
 
 static uint64_t sys_mkdir(const char *path, mode_t mode) {
-  (void)mode; // TODO: Implement mode support
-
   if (!path)
     return -1;
 
@@ -494,11 +555,21 @@ static uint64_t sys_mkdir(const char *path, mode_t mode) {
   }
   dir_name[VFS_MAX_NAME - 1] = '\0';
 
-  vfs_node_t *parent = vfs_resolve_path(parent_path);
-  if (!parent)
+  if (dir_name[0] == '\0')
     return -1;
 
-  return vfs_create(parent, dir_name, VFS_DIRECTORY);
+  vfs_node_t *parent = vfs_resolve_path(parent_path);
+  if (!parent || !(parent->type & VFS_DIRECTORY))
+    return -1;
+
+  if (vfs_finddir(parent, dir_name))
+    return -1;
+
+  mode_t dir_perms = mode & 0777;
+  if (dir_perms == 0)
+    dir_perms = 0777;
+
+  return vfs_create(parent, dir_name, VFS_DIRECTORY, S_IFDIR | dir_perms);
 }
 
 static uint64_t sys_rmdir(const char *path) {

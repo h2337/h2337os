@@ -3,6 +3,7 @@
 #include "heap.h"
 #include "libc.h"
 #include "vfs.h"
+#include <stdbool.h>
 #include <stddef.h>
 
 // Forward declarations
@@ -11,6 +12,25 @@ static fat32_node_t *fat32_create_node_with_parent(fat32_fs_t *fs,
                                                    const char *name,
                                                    uint32_t parent_cluster,
                                                    uint32_t dir_entry_index);
+
+static mode_t fat32_mode_from_attr(uint8_t attr, bool is_dir) {
+  mode_t mode;
+
+  if (is_dir) {
+    mode = S_IFDIR | S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH |
+           S_IXOTH;
+  } else {
+    mode = S_IFREG | S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+  }
+
+  if (attr & FAT32_ATTR_READ_ONLY) {
+    mode &= ~(S_IWUSR | S_IWGRP | S_IWOTH);
+  } else if (!is_dir) {
+    mode |= S_IWGRP | S_IWOTH;
+  }
+
+  return mode;
+}
 
 static vfs_filesystem_t fat32_filesystem = {.name = "fat32",
                                             .mount = fat32_mount,
@@ -156,10 +176,18 @@ static fat32_node_t *fat32_create_node_with_parent(fat32_fs_t *fs,
     fat32_parse_filename(entry->name, node->base.name);
   }
 
-  node->base.type =
-      (entry->attr & FAT32_ATTR_DIRECTORY) ? VFS_DIRECTORY : VFS_FILE;
+  bool is_dir = (entry->attr & FAT32_ATTR_DIRECTORY) != 0;
+  bool is_read_only = (entry->attr & FAT32_ATTR_READ_ONLY) != 0;
+
+  node->base.type = is_dir ? VFS_DIRECTORY : VFS_FILE;
   node->base.size = entry->size;
-  node->base.flags = VFS_READ | VFS_WRITE;
+  node->base.flags = VFS_READ;
+  if (!is_read_only) {
+    node->base.flags |= VFS_WRITE;
+  }
+  node->base.mode = fat32_mode_from_attr(entry->attr, is_dir);
+  node->base.uid = 0;
+  node->base.gid = 0;
 
   node->base.read = fat32_read;
   node->base.write = fat32_write;
@@ -173,6 +201,7 @@ static fat32_node_t *fat32_create_node_with_parent(fat32_fs_t *fs,
   node->fs = fs;
   node->first_cluster =
       ((uint32_t)entry->first_cluster_hi << 16) | entry->first_cluster_lo;
+  node->base.inode = node->first_cluster;
   node->current_cluster = node->first_cluster;
   node->parent_cluster = parent_cluster;
   node->dir_entry_index = dir_entry_index;
@@ -458,13 +487,16 @@ vfs_node_t *fat32_finddir(vfs_node_t *node, const char *name) {
   return NULL;
 }
 
-int fat32_create(vfs_node_t *parent, const char *name, uint32_t type) {
+int fat32_create(vfs_node_t *parent, const char *name, uint32_t type,
+                 mode_t mode) {
   fat32_node_t *fat_parent = (fat32_node_t *)parent;
   fat32_fs_t *fs = fat_parent->fs;
 
   if (!(parent->type & VFS_DIRECTORY)) {
     return -1;
   }
+
+  bool read_only = (mode & (S_IWUSR | S_IWGRP | S_IWOTH)) == 0;
 
   uint32_t new_cluster = fat32_find_free_cluster(fs);
   if (new_cluster == 0) {
@@ -479,6 +511,9 @@ int fat32_create(vfs_node_t *parent, const char *name, uint32_t type) {
   fat32_create_short_name(name, new_entry.name);
   new_entry.attr =
       (type == VFS_DIRECTORY) ? FAT32_ATTR_DIRECTORY : FAT32_ATTR_ARCHIVE;
+  if (read_only) {
+    new_entry.attr |= FAT32_ATTR_READ_ONLY;
+  }
   new_entry.first_cluster_hi = (new_cluster >> 16) & 0xFFFF;
   new_entry.first_cluster_lo = new_cluster & 0xFFFF;
   new_entry.size = 0;

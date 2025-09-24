@@ -1283,38 +1283,52 @@ process_t *process_fork(void) {
 }
 
 int process_waitpid(int pid, int *status, int options) {
-  (void)options;
-
   process_t *parent = get_current_process_local();
   if (!parent) {
     return -1;
   }
 
+  bool nohang = (options & WNOHANG) != 0;
+  int target = pid;
+  if (target == 0) {
+    target = -1;
+  }
+
   while (1) {
     process_t *child = parent->children;
     process_t *prev = NULL;
+    bool found_match = false;
 
     while (child) {
-      if ((pid == -1 || child->pid == (uint32_t)pid) &&
-          child->state == PROCESS_STATE_ZOMBIE) {
-        if (status) {
-          *status = child->exit_status;
+      bool matches = (target == -1) || child->pid == (uint32_t)target;
+      if (matches) {
+        found_match = true;
+        if (child->state == PROCESS_STATE_ZOMBIE) {
+          if (status) {
+            *status = child->exit_status;
+          }
+
+          if (prev) {
+            prev->sibling = child->sibling;
+          } else {
+            parent->children = child->sibling;
+          }
+
+          uint32_t child_pid = child->pid;
+          process_destroy(child);
+          return (int)child_pid;
         }
-
-        if (prev) {
-          prev->sibling = child->sibling;
-        } else {
-          parent->children = child->sibling;
-        }
-
-        uint32_t child_pid = child->pid;
-
-        process_destroy(child);
-
-        return child_pid;
       }
       prev = child;
       child = child->sibling;
+    }
+
+    if (!found_match) {
+      return -1;
+    }
+
+    if (nohang) {
+      return 0;
     }
 
     parent->state = PROCESS_STATE_BLOCKED;
@@ -1331,7 +1345,9 @@ void process_ensure_standard_streams(process_t *proc) {
 
   for (int fd = 0; fd < 3; fd++) {
     if (proc->fd_table[fd] < 0) {
-      int vfs_fd = vfs_open_fd("/dev/tty", std_flags[fd]);
+      int vfs_fd = vfs_open_fd("/dev/tty", std_flags[fd],
+                               S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP |
+                                   S_IROTH | S_IWOTH);
       if (vfs_fd >= 0) {
         proc->fd_table[fd] = vfs_fd;
       }

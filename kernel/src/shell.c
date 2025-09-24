@@ -532,7 +532,7 @@ void shell_process_command(char *input) {
   strcpy(path, "/bin/");
   strcat(path, argv[0]);
 
-  vfs_node_t *file = vfs_open(path, VFS_READ);
+  vfs_node_t *file = vfs_open(path, VFS_READ, 0);
   if (file) {
     if (!(file->type & VFS_DIRECTORY)) {
       // Check if it's an ELF binary
@@ -733,7 +733,7 @@ static int cmd_cat(int argc, char **argv) {
     return 1;
   }
 
-  vfs_node_t *file = vfs_open(argv[1], VFS_READ);
+  vfs_node_t *file = vfs_open(argv[1], VFS_READ, 0);
   if (!file) {
     kprint("Error: File not found: ");
     kprint(argv[1]);
@@ -775,7 +775,8 @@ static int cmd_write(int argc, char **argv) {
     return 1;
   }
 
-  vfs_node_t *file = vfs_open(argv[1], VFS_WRITE | VFS_CREATE | VFS_TRUNCATE);
+  vfs_node_t *file =
+      vfs_open(argv[1], VFS_WRITE | VFS_CREATE | VFS_TRUNCATE, 0644);
   if (!file) {
     kprint("Error: Cannot create file: ");
     kprint(argv[1]);
@@ -852,7 +853,9 @@ static int cmd_mkdir(int argc, char **argv) {
     return 1;
   }
 
-  if (vfs_create(parent, dirname, VFS_DIRECTORY) < 0) {
+  if (vfs_create(parent, dirname, VFS_DIRECTORY,
+                 S_IFDIR | S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP |
+                     S_IROTH | S_IXOTH) < 0) {
     kprint("Error: Cannot create directory: ");
     kprint(argv[1]);
     kprint("\n");
@@ -917,7 +920,7 @@ static int cmd_touch(int argc, char **argv) {
     return 1;
   }
 
-  vfs_node_t *file = vfs_open(argv[1], VFS_WRITE | VFS_CREATE);
+  vfs_node_t *file = vfs_open(argv[1], VFS_WRITE | VFS_CREATE, 0644);
   if (!file) {
     kprint("Error: Cannot create file: ");
     kprint(argv[1]);
@@ -988,7 +991,7 @@ static int cmd_exec(int argc, char **argv) {
   }
 
   // Check if file exists
-  vfs_node_t *file = vfs_open(path, VFS_READ);
+  vfs_node_t *file = vfs_open(path, VFS_READ, 0);
   if (!file) {
     kprint("Error: File not found: ");
     kprint(path);

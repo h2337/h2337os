@@ -12,5 +12,9 @@ char tty_getchar(void);
 bool tty_has_input(void);
 void tty_flush(void);
 void tty_handle_input(char c);
+void tty_get_winsize(unsigned short *rows, unsigned short *cols);
+void tty_set_winsize(unsigned short rows, unsigned short cols);
+size_t tty_bytes_available(void);
+int tty_ioctl(unsigned long request, void *arg);
 
 #endif

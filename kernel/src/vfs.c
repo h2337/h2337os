@@ -39,7 +39,12 @@ void vfs_init(void) {
   memset(vfs_root, 0, sizeof(vfs_node_t));
   strcpy(vfs_root->name, "/");
   vfs_root->type = VFS_DIRECTORY;
-  vfs_root->flags = VFS_READ;
+  vfs_root->flags = VFS_READ | VFS_WRITE;
+  vfs_root->mode = S_IFDIR | S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP |
+                   S_IROTH | S_IXOTH;
+  vfs_root->uid = 0;
+  vfs_root->gid = 0;
+  vfs_root->inode = 1;
 
   kprint("VFS initialized\n");
 }
@@ -279,7 +284,7 @@ vfs_node_t *vfs_resolve_path(const char *path) {
   return current;
 }
 
-vfs_node_t *vfs_open(const char *path, uint32_t flags) {
+vfs_node_t *vfs_open(const char *path, uint32_t flags, mode_t mode) {
   vfs_node_t *special = vfs_lookup_special(path);
   if (special) {
     if (special->open) {
@@ -291,6 +296,13 @@ vfs_node_t *vfs_open(const char *path, uint32_t flags) {
   vfs_node_t *node = vfs_resolve_path(path);
 
   if (!node && (flags & VFS_CREATE)) {
+    mode_t create_mode = mode;
+    if (create_mode == 0) {
+      create_mode =
+          S_IFREG | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+    } else {
+      create_mode = (create_mode & 0777) | S_IFREG;
+    }
     char normalized[VFS_MAX_PATH];
     vfs_normalize_path(path, normalized);
 
@@ -321,7 +333,7 @@ vfs_node_t *vfs_open(const char *path, uint32_t flags) {
     }
 
     if (parent && parent->create) {
-      if (parent->create(parent, filename, VFS_FILE) == 0) {
+      if (parent->create(parent, filename, VFS_FILE, create_mode) == 0) {
         node = vfs_resolve_path(path);
       }
     }
@@ -370,9 +382,10 @@ vfs_node_t *vfs_finddir(vfs_node_t *node, const char *name) {
   return NULL;
 }
 
-int vfs_create(vfs_node_t *parent, const char *name, uint32_t type) {
+int vfs_create(vfs_node_t *parent, const char *name, uint32_t type,
+               mode_t mode) {
   if (parent && parent->create && (parent->type & VFS_DIRECTORY)) {
-    return parent->create(parent, name, type);
+    return parent->create(parent, name, type, mode);
   }
   return -1;
 }
@@ -384,8 +397,8 @@ int vfs_unlink(vfs_node_t *parent, const char *name) {
   return -1;
 }
 
-int vfs_open_fd(const char *path, uint32_t flags) {
-  vfs_node_t *node = vfs_open(path, flags);
+int vfs_open_fd(const char *path, uint32_t flags, mode_t mode) {
+  vfs_node_t *node = vfs_open(path, flags, mode);
   if (!node) {
     return -1;
   }
@@ -541,3 +554,18 @@ int vfs_seek_fd(int fd, int32_t offset, int whence) {
 vfs_node_t *vfs_get_root(void) { return vfs_root; }
 
 void vfs_set_root(vfs_node_t *root) { vfs_root = root; }
+
+vfs_node_t *vfs_get_node_from_fd(int fd) {
+  vfs_node_t *node = NULL;
+
+  spin_lock(&fd_lock);
+  for (int i = 0; i < VFS_MAX_OPEN_FILES; i++) {
+    if (open_files[i].in_use && open_files[i].fd == fd) {
+      node = open_files[i].node;
+      break;
+    }
+  }
+  spin_unlock(&fd_lock);
+
+  return node;
+}

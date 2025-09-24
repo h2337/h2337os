@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "types.h"
+
 #define VFS_MAX_NAME 256
 #define VFS_MAX_PATH 4096
 #define VFS_MAX_FILESYSTEMS 16
@@ -41,7 +43,8 @@ typedef void (*vfs_open_t)(struct vfs_node *, uint32_t flags);
 typedef void (*vfs_close_t)(struct vfs_node *);
 typedef struct vfs_node *(*vfs_readdir_t)(struct vfs_node *, uint32_t index);
 typedef struct vfs_node *(*vfs_finddir_t)(struct vfs_node *, const char *name);
-typedef int (*vfs_create_t)(struct vfs_node *, const char *name, uint32_t type);
+typedef int (*vfs_create_t)(struct vfs_node *, const char *name, uint32_t type,
+                            mode_t mode);
 typedef int (*vfs_unlink_t)(struct vfs_node *, const char *name);
 
 typedef struct vfs_node {
@@ -49,6 +52,7 @@ typedef struct vfs_node {
   uint32_t inode;
   uint32_t type;
   uint32_t flags;
+  mode_t mode;
   uint32_t uid;
   uint32_t gid;
   uint32_t size;
@@ -102,7 +106,7 @@ int vfs_register_special(const char *path, vfs_node_t *node);
 int vfs_mount(const char *device, const char *mountpoint, const char *fstype);
 int vfs_unmount(const char *mountpoint);
 
-vfs_node_t *vfs_open(const char *path, uint32_t flags);
+vfs_node_t *vfs_open(const char *path, uint32_t flags, mode_t mode);
 void vfs_close(vfs_node_t *node);
 uint32_t vfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                   uint8_t *buffer);
@@ -110,10 +114,11 @@ uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
                    uint8_t *buffer);
 vfs_node_t *vfs_readdir(vfs_node_t *node, uint32_t index);
 vfs_node_t *vfs_finddir(vfs_node_t *node, const char *name);
-int vfs_create(vfs_node_t *parent, const char *name, uint32_t type);
+int vfs_create(vfs_node_t *parent, const char *name, uint32_t type,
+               mode_t mode);
 int vfs_unlink(vfs_node_t *parent, const char *name);
 
-int vfs_open_fd(const char *path, uint32_t flags);
+int vfs_open_fd(const char *path, uint32_t flags, mode_t mode);
 int vfs_create_fd(vfs_node_t *node, uint32_t flags);
 void vfs_close_fd(int fd);
 void vfs_retain_fd(int fd);
@@ -124,5 +129,6 @@ int vfs_seek_fd(int fd, int32_t offset, int whence);
 vfs_node_t *vfs_get_root(void);
 void vfs_set_root(vfs_node_t *root);
 vfs_node_t *vfs_resolve_path(const char *path);
+vfs_node_t *vfs_get_node_from_fd(int fd);
 
 #endif
