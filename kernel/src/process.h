@@ -110,10 +110,9 @@ void *process_sbrk(intptr_t increment);
 void process_ensure_standard_streams(process_t *proc);
 vm_region_t *process_vm_find_region(process_t *proc, uint64_t addr);
 vm_region_t *process_vm_add_region(process_t *proc, uint64_t start,
-                                   uint64_t length, int prot, int flags,
-                                   int fd, off_t offset);
-int process_vm_remove_region(process_t *proc, uint64_t start,
-                             uint64_t length);
+                                   uint64_t length, int prot, int flags, int fd,
+                                   off_t offset);
+int process_vm_remove_region(process_t *proc, uint64_t start, uint64_t length);
 void process_vm_clear_regions(process_t *proc);
 uint64_t process_vm_reserve_addr(process_t *proc, size_t length);
 void process_vm_unmap_range(process_t *proc, uint64_t start, uint64_t length);

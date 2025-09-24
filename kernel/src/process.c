@@ -130,8 +130,8 @@ uint64_t process_vm_reserve_addr(process_t *proc, size_t length) {
 }
 
 vm_region_t *process_vm_add_region(process_t *proc, uint64_t start,
-                                   uint64_t length, int prot, int flags,
-                                   int fd, off_t offset) {
+                                   uint64_t length, int prot, int flags, int fd,
+                                   off_t offset) {
   if (!proc || length == 0) {
     return NULL;
   }
@@ -181,8 +181,7 @@ vm_region_t *process_vm_find_region(process_t *proc, uint64_t addr) {
   return NULL;
 }
 
-int process_vm_remove_region(process_t *proc, uint64_t start,
-                             uint64_t length) {
+int process_vm_remove_region(process_t *proc, uint64_t start, uint64_t length) {
   if (!proc || length == 0) {
     return -1;
   }

@@ -1,14 +1,14 @@
 #include "idt.h"
 #include "console.h"
 #include "keyboard.h"
+#include "libc.h"
+#include "limine_requests.h"
 #include "pic.h"
 #include "pit.h"
 #include "pmm.h"
 #include "process.h"
 #include "smp.h"
 #include "vmm.h"
-#include "libc.h"
-#include "limine_requests.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -199,8 +199,7 @@ static bool handle_cow_fault(process_t *proc, uint64_t page_addr) {
 
     pmm_ref_dec(phys);
   } else {
-    if (!vmm_update_entry(proc->pagemap, page_addr, VMM_WRITABLE,
-                          VMM_COW)) {
+    if (!vmm_update_entry(proc->pagemap, page_addr, VMM_WRITABLE, VMM_COW)) {
       return false;
     }
   }
@@ -238,7 +237,8 @@ static bool handle_user_page_fault(struct interrupt_frame *frame) {
     }
 
     if (region) {
-      uint64_t flags = region->flags ? region->flags : (VMM_USER | VMM_NO_EXECUTE);
+      uint64_t flags =
+          region->flags ? region->flags : (VMM_USER | VMM_NO_EXECUTE);
       return map_zero_page(proc, page_addr, flags);
     }
 

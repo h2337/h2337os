@@ -153,7 +153,8 @@ void pmm_init(void) {
 
   for (uint64_t i = 0; i < memmap->entry_count; i++) {
     struct limine_memmap_entry *entry = memmap->entries[i];
-    if (entry->type == LIMINE_MEMMAP_USABLE && entry->length >= metadata_bytes) {
+    if (entry->type == LIMINE_MEMMAP_USABLE &&
+        entry->length >= metadata_bytes) {
       uint64_t metadata_phys = entry->base;
       bitmap = (uint8_t *)(metadata_phys + hhdm_offset);
       memset(bitmap, 0xFF, bitmap_size);

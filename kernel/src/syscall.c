@@ -200,7 +200,8 @@ static uint64_t sys_mmap(void *addr, size_t length, int prot, int flags, int fd,
     return (uint64_t)-1;
   }
 
-  uint64_t aligned_length = (length + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+  uint64_t aligned_length =
+      (length + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
   if (aligned_length == 0) {
     aligned_length = PAGE_SIZE;
   }
@@ -228,8 +229,8 @@ static uint64_t sys_mmap(void *addr, size_t length, int prot, int flags, int fd,
     vmm_flags |= VMM_NO_EXECUTE;
   }
 
-  vm_region_t *region =
-      process_vm_add_region(proc, start, aligned_length, prot, flags, fd, offset);
+  vm_region_t *region = process_vm_add_region(proc, start, aligned_length, prot,
+                                              flags, fd, offset);
   if (!region) {
     if (!(flags & MAP_FIXED)) {
       proc->mmap_base = original_base;
@@ -250,7 +251,8 @@ static uint64_t sys_munmap(void *addr, size_t length) {
 
   uint64_t start = (uint64_t)addr;
   uint64_t aligned_start = start & ~(uint64_t)(PAGE_SIZE - 1);
-  uint64_t aligned_length = (length + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+  uint64_t aligned_length =
+      (length + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
   if (aligned_length == 0) {
     aligned_length = PAGE_SIZE;
   }
