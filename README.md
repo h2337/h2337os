@@ -11,7 +11,7 @@ A 64-bit monolithic hobby OS for x86_64, hand-rolled in C with Limine boot, FAT3
 PS/2 keyboard (full scancodes, Shift/Ctrl/Alt, Caps/Num/Scroll lock), COM1–COM4 serial debug, Flanterm VGA text console with cursor+scroll, PCI bus scan with config access, 8254 PIT timer, 8259 PIC interrupts.
 
 ## Kernel Modules
-GDT, IDT, PMM, VMM, heap, scheduler, syscalls, VFS, FAT32, RAM disk, keyboard, console, serial, PIC, PIT, PCI, ELF loader, usermode bridge, shell, spinlock sync, libc shims, Limine requests.
+GDT, IDT, PMM, VMM, SMP, heap, scheduler, syscalls, VFS, FAT32, RAM disk, keyboard, console, serial, PIC, PIT, PCI, ELF loader, usermode bridge, shell, spinlock sync, libc shims, Limine requests.
 
 ## Build & Boot
 Need x86_64 GCC cross or Clang, GNU Make, NASM, xorriso, mtools, QEMU, curl. Then:
